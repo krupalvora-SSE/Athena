@@ -1,0 +1,470 @@
+"""
+Phase 2 — ERPNext live query tools.
+
+Routing strategy (in order):
+  1. Regex router  — fast, zero latency, handles known patterns
+  2. LLM classifier — fallback when regex misses, uses Ollama JSON mode
+  3. RAG            — returned None from both above → docs pipeline
+
+Intent taxonomy:
+  user_roles    — what roles do I/user X have?
+  role_perms    — what permissions does role X have? (optionally filtered by doctype)
+  doctype_roles — which roles have access to doctype X?
+  access_check  — can user X perform action on doctype Y?
+  tasks         — open tasks / todos for the user
+  stock         — inventory balance for item X
+  rag           — general ERP docs question
+"""
+
+import re
+import json
+import os
+import logging
+import httpx
+
+logger = logging.getLogger(__name__)
+
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://host.docker.internal:11434")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+
+# ---------------------------------------------------------------------------
+# Doctype alias map
+# ---------------------------------------------------------------------------
+
+DOCTYPE_ALIASES: dict[str, str] = {
+    "DN":  "Delivery Note",
+    "SO":  "Sales Order",
+    "PO":  "Purchase Order",
+    "PI":  "Purchase Invoice",
+    "SI":  "Sales Invoice",
+    "GRN": "Purchase Receipt",
+    "PR":  "Purchase Receipt",
+    "MR":  "Material Request",
+    "STE": "Stock Entry",
+    "SE":  "Stock Entry",
+    "WO":  "Work Order",
+    "BOM": "BOM",
+    "JE":  "Journal Entry",
+    "PE":  "Payment Entry",
+    "PKL": "Pick List",
+    "SR":  "Stock Reconciliation",
+    "RFQ": "Request for Quotation",
+    "SQ":  "Supplier Quotation",
+    "SCO": "Subcontracting Order",
+}
+
+
+def resolve_doctype(token: str) -> str:
+    upper = token.strip().upper()
+    return DOCTYPE_ALIASES.get(upper, token.strip())
+
+
+# ---------------------------------------------------------------------------
+# Regex intent patterns
+# ---------------------------------------------------------------------------
+
+_ROLE_PERMS_RE = re.compile(
+    r"(permissions?\s+(for|of|does|that)\s+role"
+    r"|role\s*[-–:]\s*\S"
+    r"|what\s+(can|permissions?).*(role)"
+    r"|\brole\b.*(permissions?|access|can do|has\s+access))",
+    re.I,
+)
+_DOCTYPE_ROLES_RE = re.compile(
+    r"(for\s+(doctype\s+)?[A-Za-z].*what\s+roles?"
+    r"|\bwho\s+can\s+(access|view|edit|submit|create)"
+    r"|\baccess\s+(to\s+)?(doctype\s+)?\S"
+    r"|what\s+roles?.*(access|permission).*(to\s+)?\S"
+    r"|\b(BOM|DN|SO|PO|PI|SI|GRN|MR|WO|JE|PE|PKL|RFQ)\b.*(roles?|access|permission)"
+    r"|(roles?|access).*(on|for|in|to)\s+\b[A-Z])",
+    re.I,
+)
+_USER_ROLES_RE = re.compile(
+    r"(my\s+roles?"
+    r"|what\s+roles?\s+(do\s+i|i\s+have|does\s+\S+\s+have)"
+    r"|list\s+(all\s+)?roles?"
+    r"|roles?\s+(i|for user|assigned to)"
+    r"|what\s+all\s+roles)",
+    re.I,
+)
+_ACCESS_CHECK_RE = re.compile(
+    r"(can\s+(i|user\s+\S+)\s+(access|view|edit|create|delete|submit)"
+    r"|\bdo\s+i\s+have\s+(access|permission)\b)",
+    re.I,
+)
+_TASK_RE  = re.compile(r"\b(my\s+(open\s+)?tasks?|open\s+tasks?|todos?|assigned\s+to\s+me)\b", re.I)
+_STOCK_RE = re.compile(r"\b(stock|balance|qty|quantity|bin|warehouse|inventory)\b", re.I)
+_PROCESS_INTENT_RE = re.compile(
+    r"\b(process|how\s+to|how\s+do|steps?\s+to|procedure|way\s+to|method\s+to|what\s+is\s+the\s+step|next\s+step)\b",
+    re.I,
+)
+_USERS_WITH_ROLE_RE = re.compile(
+    r"(users?\s+(with|having|assigned|who\s+have)\s+(the\s+)?role"
+    r"|list\s+(of\s+)?users?\s+(with|for|having)\s+role"
+    r"|who\s+(has|have|is\s+assigned)\s+(the\s+)?role)",
+    re.I,
+)
+
+# Detects references back to prior context ("that role", "it", "those")
+_REFERS_BACK_RE = re.compile(r"\b(that|those|the same|it|its|their|this)\b", re.I)
+
+
+# ---------------------------------------------------------------------------
+# LLM classifier (fallback)
+# ---------------------------------------------------------------------------
+
+_CLASSIFIER_PROMPT = """\
+You are an intent classifier for an ERP support chatbot. Given a question and optional conversation history, classify the intent and extract parameters.
+
+Intents:
+- user_roles: asking about roles assigned to a user. params: username (email or null for self)
+- role_perms: asking about what permissions a role has. params: role (role name), doctype (optional filter)
+- doctype_roles: asking which roles have access to a doctype. params: doctype (name or abbreviation)
+- access_check: asking if a user can perform an action on a doctype. params: username, doctype, permission (read/write/create/delete/submit/cancel)
+- tasks: asking about open tasks or todos. params: {{}}
+- stock: asking about stock or inventory balance for an item. params: item_code
+- users_with_role: asking which users have a specific role. params: {{"role": "role name"}}
+- rag: general ERP documentation or process question not covered above. params: {{}}
+
+Recent conversation history (may be empty):
+{history}
+
+Question: {question}
+
+Respond with ONLY valid JSON, no explanation:
+{{"intent": "<intent>", "params": {{"username": null, "role": null, "doctype": null, "permission": null, "item_code": null}}}}"""
+
+
+def _llm_classify(question: str, history: str = "") -> dict | None:
+    prompt = _CLASSIFIER_PROMPT.format(history=history or "(none)", question=question)
+    try:
+        resp = httpx.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"},
+            timeout=8.0,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "")
+        data = json.loads(raw)
+        if "intent" in data:
+            return data
+    except Exception as e:
+        logger.warning(f"LLM classifier failed: {e}")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Router
+# ---------------------------------------------------------------------------
+
+def route_query(question: str, username: str, history: str = "") -> dict | None:
+    """
+    Returns a result dict if a DB tool handles it, else None (fall through to RAG).
+    """
+    try:
+        import db
+
+        # --- Regex pass (fast) ---
+        # If question refers back to a role ("that role", "it") and history has one,
+        # treat as role_perms rather than doctype_roles even if doctype_roles regex fires.
+        _refers_to_role = _REFERS_BACK_RE.search(question) and _extract_role_name(question, history)
+        if _DOCTYPE_ROLES_RE.search(question) and not _refers_to_role:
+            result = _handle_doctype_roles(question, db, history)
+            if result:
+                return result
+
+        if _ROLE_PERMS_RE.search(question) or _refers_to_role:
+            return _handle_role_permissions(question, db, history)
+
+        if _USERS_WITH_ROLE_RE.search(question):
+            return _handle_users_with_role(question, db)
+
+        if _USER_ROLES_RE.search(question):
+            return _handle_user_roles(question, username, db, history)
+
+        if _ACCESS_CHECK_RE.search(question):
+            return _handle_access_check(question, username, db)
+
+        if _TASK_RE.search(question):
+            return _handle_tasks(username, db)
+
+        if _STOCK_RE.search(question) and not _PROCESS_INTENT_RE.search(question):
+            return _handle_stock(question, db, history)
+
+    except Exception as e:
+        logger.warning(f"DB tool (regex path) failed, trying LLM classifier: {e}")
+
+    # --- LLM classifier fallback ---
+    classification = _llm_classify(question, history)
+    if not classification or classification.get("intent") == "rag":
+        return None
+
+    try:
+        import db
+        return _dispatch_classified(classification, question, username, db)
+    except Exception as e:
+        logger.warning(f"DB tool (LLM path) failed, falling back to RAG: {e}")
+
+    return None
+
+
+def _dispatch_classified(classification: dict, question: str, username: str, db) -> dict | None:
+    intent = classification.get("intent", "rag")
+    params = classification.get("params", {})
+
+    role     = params.get("role")
+    doctype  = params.get("doctype")
+    item     = params.get("item_code")
+    target   = params.get("username") or username
+    perm     = params.get("permission", "read")
+
+    if intent == "user_roles":
+        return _format_user_roles(target, db.get_user_roles(target), db.get_user_permissions(target))
+
+    if intent == "role_perms" and role:
+        rows = db.get_role_doctype_permissions(role, resolve_doctype(doctype) if doctype else None)
+        return _format_role_permissions(role, resolve_doctype(doctype) if doctype else None, rows)
+
+    if intent == "doctype_roles" and doctype:
+        resolved = resolve_doctype(doctype)
+        return _format_doctype_roles(resolved, db.get_doctype_role_permissions(resolved))
+
+    if intent == "access_check" and doctype:
+        resolved = resolve_doctype(doctype)
+        allowed = db.can_user_access(target, resolved, perm if perm != "view" else "read")
+        verb = "can" if allowed else "cannot"
+        return {"answer": f"**{target}** **{verb}** {perm} **{resolved}**.", "sources": []}
+
+    if intent == "tasks":
+        return _handle_tasks(username, db)
+
+    if intent == "stock" and item:
+        return _format_stock(item, db.get_stock_balance(item))
+
+    if intent == "users_with_role" and role:
+        users = db.get_users_with_role(role)
+        if not users:
+            return {"answer": f"No users found with role **{role}**.", "sources": []}
+        lines = "\n".join(f"- {u}" for u in users)
+        return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Parameter extractors (with history fallback for context resolution)
+# ---------------------------------------------------------------------------
+
+# A Frappe role name is always Title Case words: "Purchase Manager", "WH Bulk Return User"
+# This pattern captures one or more consecutive Title Case words and stops at lowercase.
+_TITLE_CASE_WORDS = r"[A-Z][A-Za-z0-9]*(?:\s+[A-Z][A-Za-z0-9]*)*"
+
+
+def _extract_role_name(question: str, history: str = "") -> str | None:
+    # "role - Purchase Manager" / "role: WH Bulk Return User"
+    m = re.search(rf"\brole\s*[-–:]\s*({_TITLE_CASE_WORDS})", question)
+    if m:
+        return m.group(1).strip()
+    # "for role Purchase Manager" / "does role Stock User"
+    m = re.search(rf"\b(?:for|of|does)\s+role\s+({_TITLE_CASE_WORDS})", question)
+    if m:
+        return m.group(1).strip()
+    # History fallback: "that role" → look for a role name in history
+    if history and _REFERS_BACK_RE.search(question):
+        m = re.search(rf"\brole\s*[-–:]\s*({_TITLE_CASE_WORDS})", history)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _extract_doctype_filter(question: str) -> str | None:
+    m = re.search(r"\b(?:on|for|in|doctype)\s+([A-Za-z][A-Za-z0-9 \-]{1,40})(?:\?|$)", question, re.I)
+    if m:
+        return resolve_doctype(m.group(1).strip())
+    return None
+
+
+_TRAILING_NOISE_RE = re.compile(r"\s+\b(too|also|as well|additionally|either)\b.*$", re.I)
+
+def _extract_doctype_subject(question: str, history: str = "") -> str | None:
+    for abbr in DOCTYPE_ALIASES:
+        if re.search(rf"\b{re.escape(abbr)}\b", question, re.I):
+            return DOCTYPE_ALIASES[abbr]
+    m = re.search(
+        r"\b(?:for|access|on|to|about)\s+(?:doctype\s+)?([A-Z][A-Za-z ]{2,40}?)(?:\s+what|\s+who|\s+roles?|\?|$)",
+        question, re.I,
+    )
+    if m:
+        raw = _TRAILING_NOISE_RE.sub("", m.group(1)).strip()
+        return resolve_doctype(raw)
+    # History fallback
+    if history and _REFERS_BACK_RE.search(question):
+        for abbr in DOCTYPE_ALIASES:
+            if re.search(rf"\b{re.escape(abbr)}\b", history, re.I):
+                return DOCTYPE_ALIASES[abbr]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Formatters (shared between regex and LLM dispatch paths)
+# ---------------------------------------------------------------------------
+
+def _format_user_roles(target: str, roles: list, perms: list) -> dict:
+    if not roles:
+        return {"answer": f"No roles found for **{target}**.", "sources": []}
+    answer = f"**{target}** has {len(roles)} roles:\n" + "\n".join(f"- {r}" for r in roles)
+    if perms:
+        perm_lines = [f"- {p['allow']}: {p['for_value']}" for p in perms[:10]]
+        answer += "\n\nUser Permissions (first 10):\n" + "\n".join(perm_lines)
+    return {"answer": answer, "sources": []}
+
+
+def _format_role_permissions(role: str, doctype_filter: str | None, rows: list) -> dict:
+    if not rows:
+        scope = f" on **{doctype_filter}**" if doctype_filter else ""
+        return {"answer": f"No permissions configured for role **{role}**{scope}.", "sources": []}
+    flags_cols = ("read", "write", "create", "delete", "submit", "cancel", "amend")
+    by_doctype: dict[str, set] = {}
+    for r in rows:
+        dt = r["parent"]
+        flags = {f for f in flags_cols if r.get(f)}
+        by_doctype.setdefault(dt, set()).update(flags)
+    lines = [
+        f"- **{dt}**: {', '.join(sorted(flags))}"
+        for dt, flags in sorted(by_doctype.items()) if flags
+    ]
+    scope = f" on **{doctype_filter}**" if doctype_filter else f" ({len(lines)} doctypes)"
+    return {"answer": f"Permissions for role **{role}**{scope}:\n" + "\n".join(lines), "sources": []}
+
+
+def _format_doctype_roles(doctype: str, rows: list) -> dict:
+    if not rows:
+        return {"answer": f"No permissions configured for doctype **{doctype}**.", "sources": []}
+    flags_cols = ("read", "write", "create", "delete", "submit", "cancel", "amend")
+    by_role: dict[str, set] = {}
+    for r in rows:
+        flags = {f for f in flags_cols if r.get(f)}
+        by_role.setdefault(r["role"], set()).update(flags)
+    lines = [
+        f"- **{role}**: {', '.join(sorted(flags))}"
+        for role, flags in sorted(by_role.items()) if flags
+    ]
+    return {"answer": f"Roles with access to **{doctype}** ({len(lines)} roles):\n" + "\n".join(lines), "sources": []}
+
+
+def _format_stock(item_code: str, rows: list, limit: int | None = None) -> dict:
+    if not rows:
+        return {"answer": f"No stock records found for item **{item_code}**.", "sources": []}
+    if limit is not None:
+        rows = sorted(rows, key=lambda r: r["actual_qty"], reverse=True)[:limit]
+    lines = [f"- {r['warehouse']}: {r['actual_qty']} (reserved: {r['reserved_qty']})" for r in rows]
+    return {"answer": f"Stock balance for **{item_code}**:\n" + "\n".join(lines), "sources": []}
+
+
+# ---------------------------------------------------------------------------
+# Handlers (thin wrappers over extractors + formatters)
+# ---------------------------------------------------------------------------
+
+def _handle_doctype_roles(question: str, db, history: str = "") -> dict | None:
+    doctype = _extract_doctype_subject(question, history)
+    if not doctype:
+        return None
+    return _format_doctype_roles(doctype, db.get_doctype_role_permissions(doctype))
+
+
+def _handle_role_permissions(question: str, db, history: str = "") -> dict:
+    role = _extract_role_name(question, history)
+    if not role:
+        return {"answer": "Please specify the role name, e.g. 'what permissions does role **Purchase Manager** have?'", "sources": []}
+    doctype_filter = _extract_doctype_filter(question)
+    rows = db.get_role_doctype_permissions(role, doctype_filter)
+    return _format_role_permissions(role, doctype_filter, rows)
+
+
+def _handle_user_roles(question: str, username: str, db, history: str = "") -> dict:
+    email_match = re.search(r"[\w.+\-]+@[\w\-]+(?:\.[a-z]+)?", question, re.I)
+    target = email_match.group(0) if email_match else username
+    roles = db.get_user_roles(target)
+    if not roles and "@" in target:
+        resolved = db.find_user_by_partial_email(target)
+        if resolved:
+            target = resolved
+            roles = db.get_user_roles(target)
+    return _format_user_roles(target, roles, db.get_user_permissions(target))
+
+
+def _handle_access_check(question: str, username: str, db) -> dict | None:
+    email_match = re.search(r"[\w.+\-]+@[\w\-]+(?:\.[a-z]+)?", question, re.I)
+    target = email_match.group(0) if email_match else username
+    dt_match = re.search(
+        r"(access|view|edit|create|delete|submit)\s+([A-Z][A-Za-z ]{2,30}?)(?:\?|$|\s+in\b)", question,
+    )
+    if not dt_match:
+        return None
+    doctype = resolve_doctype(dt_match.group(2).strip())
+    perm = dt_match.group(1).lower()
+    if perm == "view":
+        perm = "read"
+    allowed = db.can_user_access(target, doctype, perm)
+    verb = "can" if allowed else "cannot"
+    return {"answer": f"**{target}** **{verb}** {perm} **{doctype}**.", "sources": []}
+
+
+def _handle_tasks(username: str, db) -> dict:
+    tasks = db.get_open_tasks_for_user(username)
+    if not tasks:
+        return {"answer": f"No open tasks found for **{username}**.", "sources": []}
+    lines = []
+    for t in tasks[:10]:
+        ref = f" ({t['reference_type']} — {t['reference_name']})" if t.get("reference_type") else ""
+        desc = (t.get("description") or "")[:80]
+        lines.append(f"- [{t.get('priority', 'Medium')}] {desc}{ref}")
+    return {"answer": f"Open tasks for **{username}**:\n" + "\n".join(lines), "sources": []}
+
+
+def _handle_users_with_role(question: str, db) -> dict:
+    role = _extract_role_name(question)
+    if not role:
+        m = re.search(r"\brole\s+([A-Z][A-Za-z0-9 \-]+)", question)
+        if m:
+            role = m.group(1).strip()
+    if not role:
+        return {"answer": "Please specify a role name, e.g. 'users with role **System Manager**'.", "sources": []}
+    users = db.get_users_with_role(role)
+    if not users:
+        return {"answer": f"No users found with role **{role}**.", "sources": []}
+    lines = "\n".join(f"- {u}" for u in users)
+    return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
+
+
+def _handle_stock(question: str, db, history: str = "") -> dict:
+    # Parse optional top-N limit
+    limit_match = re.search(r"\btop\s+(\d+)\b", question, re.I)
+    limit = int(limit_match.group(1)) if limit_match else None
+
+    # Try "item code XXXX YYYY" pattern first
+    m = re.search(r"\bitem\s+code\s+([A-Z0-9][A-Z0-9 \-]+?)(?:\s+in\b|\s+at\b|\s+for\b|\?|$)", question, re.I)
+    if m:
+        item_code = m.group(1).strip()
+    else:
+        # Fall back to uppercase-only token (no spaces)
+        item_match = re.search(r"\b([A-Z][A-Z0-9\-]{2,})\b", question)
+        if not item_match and history:
+            item_match = re.search(r"\b([A-Z][A-Z0-9\-]{2,})\b", history)
+        item_code = item_match.group(1) if item_match else None
+
+    if not item_code:
+        return {"answer": "Please specify an item code to check stock balance.", "sources": []}
+    return _format_stock(item_code, db.get_stock_balance(item_code), limit)
+
+
+# ---------------------------------------------------------------------------
+# Source relevance check
+# ---------------------------------------------------------------------------
+
+_WANT_SOURCES_RE = re.compile(
+    r"\b(source|sources|reference|references|where did you|show.*(doc|link|ref))\b", re.I
+)
+
+def wants_sources(question: str) -> bool:
+    return bool(_WANT_SOURCES_RE.search(question))

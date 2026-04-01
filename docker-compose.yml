@@ -1,0 +1,26 @@
+services:
+  api:
+    build: ./api
+    ports:
+      - "7001:7001"
+    volumes:
+      - ./chroma_data:/chroma_data
+      - ./db:/db:ro
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_MODEL=qwen2.5:7b
+      - OLLAMA_EMBED_MODEL=nomic-embed-text
+      - CHROMA_PERSIST_DIR=/chroma_data
+      - DB_CONFIG_PATH=/db/config.json
+      - DB_HOST=frappe_docker_devcontainer-mariadb-1
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - default
+      - frappe_network
+    restart: unless-stopped
+
+networks:
+  frappe_network:
+    external: true
+    name: frappe_docker_devcontainer_default

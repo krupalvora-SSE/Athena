@@ -1,0 +1,13 @@
+{
+ "allow_tests": true,
+ "db_host_type": "localhost",
+ "db_host": "mariadb",
+ "db_name": "_a65b4d0628535127",
+ "db_password": "rCPeyZmeGy8XOzYY",
+ "db_type": "mariadb",
+ "encryption_key": "kF03r9kQ9ZKxI-XCbsfW8yEp47AxqH7n-gvS1ibUNY8=",
+ "use_https": 1,
+  "s3_bucket_name":"sse-stg-erp",
+ "s3_region_name":"ap-south-1",
+ "use_s3": 1
+}

@@ -1,0 +1,24 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# LangChain — pinned to match ingest environment
+langchain==0.3.28
+langchain-community==0.3.31
+langchain-ollama==0.3.10
+langchain-chroma==0.2.6
+
+# ChromaDB — must match version used during ingest (1.5.5)
+chromadb==1.5.5
+
+# Hybrid search
+rank-bm25==0.2.2
+
+# HTTP client for ERPNext API calls
+httpx==0.27.2
+
+# Direct MariaDB access
+PyMySQL==1.1.1
+
+# Document loading/splitting
+pypdf==5.0.1
