@@ -390,4 +390,4 @@ def test_bug_summary(capsys):
         for b in fixed_bugs:
             print(f"[FIXED] {b['id']} ({b['log']}): {b['description']}")
         print(f"{'='*60}")
-    assert len(open_bugs) == 5, f"Bug count changed — update KNOWN_BUGS list"  # noqa: E501
+    assert len(open_bugs) == 0, f"Bug count changed — update KNOWN_BUGS list"  # noqa: E501

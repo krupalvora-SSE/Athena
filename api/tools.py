@@ -100,13 +100,62 @@ _PROCESS_INTENT_RE = re.compile(
 )
 _USERS_WITH_ROLE_RE = re.compile(
     r"(users?\s+(with|having|assigned|who\s+have)\s+(the\s+)?role"
-    r"|list\s+(of\s+)?users?\s+(with|for|having)\s+role"
+    r"|list\s+(of\s+)?users?\s+(with|for|having)(\s+access\s+to)?\s+role"
     r"|who\s+(has|have|is\s+assigned)\s+(the\s+)?role)",
     re.I,
 )
 
 # Detects references back to prior context ("that role", "it", "those")
 _REFERS_BACK_RE = re.compile(r"\b(that|those|the same|it|its|their|this)\b", re.I)
+
+# Identity questions — answered directly without hitting the LLM
+_IDENTITY_RE = re.compile(
+    r"\b(what\s+is\s+your\s+name"
+    r"|who\s+are\s+you"
+    r"|what\s+are\s+you\s+called"
+    r"|who\s+(made|created|built|developed)\s+you"
+    r"|introduce\s+yourself"
+    r"|your\s+name)\b",
+    re.I,
+)
+
+# NL-to-SQL: patterns that signal the user wants a live DB query
+_NL_QUERY_RE = re.compile(
+    r"(how\s+many\b"
+    r"|\bcount\s+(of|all|\*)"
+    r"|\btotal\s+(number|count)\b"
+    r"|\bquery\s+(the\s+)?(db|database|mariadb|mysql)\b"
+    r"|\brun\s+(a\s+)?query\b"
+    r"|\bselect\b.+\bfrom\b"
+    r"|\blist\s+all\s+(records|documents|entries)\b"
+    r"|\b(created|submitted|cancelled)\s+(till|until|so\s+far|to\s+date)\b)",
+    re.I,
+)
+
+# Roles that are allowed to run arbitrary SELECT queries
+_DB_QUERY_ROLES = {
+    "System Manager", "Stock Manager", "Accounts Manager",
+    "Purchase Manager", "Sales Manager",
+}
+
+_SQL_GEN_PROMPT = """\
+You are a MariaDB SQL expert for a Frappe/ERPNext system.
+Frappe naming convention: DocType "Delivery Note" → table `tabDelivery Note`.
+
+Common docstatus values: 0 = Draft, 1 = Submitted, 2 = Cancelled.
+Common tables: `tabDelivery Note`, `tabSales Order`, `tabPurchase Order`,
+  `tabPurchase Invoice`, `tabSales Invoice`, `tabStock Entry`,
+  `tabMaterial Request`, `tabPurchase Receipt`, `tabWork Order`,
+  `tabBOM`, `tabPayment Entry`, `tabJournal Entry`, `tabUser`, `tabBin`.
+
+Write a single safe SELECT query for the following question.
+- Use COUNT(*) or COUNT(`name`) for totals.
+- Do NOT use INSERT, UPDATE, DELETE, DROP, or any DML/DDL.
+- Do NOT include a LIMIT clause (one will be added automatically).
+- Return ONLY the raw SQL statement, no explanation, no markdown fences.
+
+Question: {question}
+SQL:"""
 
 
 # ---------------------------------------------------------------------------
@@ -124,6 +173,7 @@ Intents:
 - tasks: asking about open tasks or todos. params: {{}}
 - stock: asking about stock or inventory balance for an item. params: item_code
 - users_with_role: asking which users have a specific role. params: {{"role": "role name"}}
+- db_query: asking for a live count, total, or data query against the ERP database. params: {{}}
 - rag: general ERP documentation or process question not covered above. params: {{}}
 
 Recent conversation history (may be empty):
@@ -165,9 +215,22 @@ def route_query(question: str, username: str, history: str = "") -> dict | None:
         import db
 
         # --- Regex pass (fast) ---
+        if _IDENTITY_RE.search(question):
+            return {
+                "answer": (
+                    "I am **Athena**, an internal ERP support assistant created by **Krupal Vora**. "
+                    "I can help you with Frappe/ERPNext roles, permissions, stock, and process questions."
+                ),
+                "sources": [],
+            }
+
         # If question refers back to a role ("that role", "it") and history has one,
         # treat as role_perms rather than doctype_roles even if doctype_roles regex fires.
         _refers_to_role = _REFERS_BACK_RE.search(question) and _extract_role_name(question, history)
+
+        if _USERS_WITH_ROLE_RE.search(question):
+            return _handle_users_with_role(question, db)
+
         if _DOCTYPE_ROLES_RE.search(question) and not _refers_to_role:
             result = _handle_doctype_roles(question, db, history)
             if result:
@@ -175,9 +238,6 @@ def route_query(question: str, username: str, history: str = "") -> dict | None:
 
         if _ROLE_PERMS_RE.search(question) or _refers_to_role:
             return _handle_role_permissions(question, db, history)
-
-        if _USERS_WITH_ROLE_RE.search(question):
-            return _handle_users_with_role(question, db)
 
         if _USER_ROLES_RE.search(question):
             return _handle_user_roles(question, username, db, history)
@@ -190,6 +250,9 @@ def route_query(question: str, username: str, history: str = "") -> dict | None:
 
         if _STOCK_RE.search(question) and not _PROCESS_INTENT_RE.search(question):
             return _handle_stock(question, db, history)
+
+        if _NL_QUERY_RE.search(question):
+            return _handle_nl_query(question, username, db)
 
     except Exception as e:
         logger.warning(f"DB tool (regex path) failed, trying LLM classifier: {e}")
@@ -247,6 +310,9 @@ def _dispatch_classified(classification: dict, question: str, username: str, db)
             return {"answer": f"No users found with role **{role}**.", "sources": []}
         lines = "\n".join(f"- {u}" for u in users)
         return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
+
+    if intent == "db_query":
+        return _handle_nl_query(question, username, db)
 
     return None
 
@@ -425,9 +491,9 @@ def _handle_tasks(username: str, db) -> dict:
 def _handle_users_with_role(question: str, db) -> dict:
     role = _extract_role_name(question)
     if not role:
-        m = re.search(r"\brole\s+([A-Z][A-Za-z0-9 \-]+)", question)
+        m = re.search(r"\brole\s+([A-Za-z][A-Za-z0-9 \-]+)", question, re.I)
         if m:
-            role = m.group(1).strip()
+            role = m.group(1).strip().title()
     if not role:
         return {"answer": "Please specify a role name, e.g. 'users with role **System Manager**'.", "sources": []}
     users = db.get_users_with_role(role)
@@ -435,6 +501,70 @@ def _handle_users_with_role(question: str, db) -> dict:
         return {"answer": f"No users found with role **{role}**.", "sources": []}
     lines = "\n".join(f"- {u}" for u in users)
     return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
+
+
+def _handle_nl_query(question: str, username: str, db) -> dict:
+    """
+    Natural-language → SQL handler.
+    1. Checks the user has a role in _DB_QUERY_ROLES.
+    2. Uses the LLM to generate a SELECT query.
+    3. Validates + executes it via db.execute_safe_select().
+    """
+    # --- Access gate ---
+    user_roles = set(db.get_user_roles(username))
+    if not user_roles.intersection(_DB_QUERY_ROLES):
+        return {
+            "answer": (
+                "You don't have permission to run live database queries. "
+                f"Required roles: {', '.join(sorted(_DB_QUERY_ROLES))}."
+            ),
+            "sources": [],
+        }
+
+    # --- Generate SQL ---
+    prompt = _SQL_GEN_PROMPT.format(question=question)
+    try:
+        resp = httpx.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        sql = resp.json().get("response", "").strip()
+    except Exception as e:
+        logger.warning(f"SQL generation failed: {e}")
+        return {"answer": "Could not generate a database query. Please try rephrasing.", "sources": []}
+
+    # Strip markdown fences if the LLM wrapped the query
+    sql = re.sub(r"^```[a-z]*\n?", "", sql, flags=re.I).rstrip("` \n")
+
+    logger.info(f"NL-query generated SQL: {sql}")
+
+    # --- Execute ---
+    try:
+        rows = db.execute_safe_select(sql, limit=100)
+    except ValueError as e:
+        return {"answer": f"Query rejected: {e}", "sources": []}
+    except Exception as e:
+        logger.warning(f"NL-query execution failed: {e}")
+        return {"answer": f"Query failed: {e}", "sources": []}
+
+    if not rows:
+        return {"answer": f"Query returned no results.\n\n```sql\n{sql}\n```", "sources": []}
+
+    # Format: if single cell (e.g. COUNT), return inline; else table-style
+    if len(rows) == 1 and len(rows[0]) == 1:
+        val = list(rows[0].values())[0]
+        return {"answer": f"**Result:** {val}\n\n```sql\n{sql}\n```", "sources": []}
+
+    lines = []
+    headers = list(rows[0].keys())
+    lines.append("| " + " | ".join(headers) + " |")
+    lines.append("| " + " | ".join("---" for _ in headers) + " |")
+    for row in rows[:50]:
+        lines.append("| " + " | ".join(str(v) for v in row.values()) + " |")
+    suffix = f"\n\n_(showing {min(len(rows), 50)} of {len(rows)} rows)_" if len(rows) > 50 else ""
+    return {"answer": "\n".join(lines) + suffix + f"\n\n```sql\n{sql}\n```", "sources": []}
 
 
 def _handle_stock(question: str, db, history: str = "") -> dict:

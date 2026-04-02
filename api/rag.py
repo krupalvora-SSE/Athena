@@ -93,9 +93,10 @@ class RAGPipeline:
 
         # Step 3: build the full LLM prompt — history and user context live here only.
         sections = [
-            "You are an internal support assistant for Frappe/ERPNext.",
+            "You are Athena, an internal ERP support assistant created by Krupal Vora.",
             "Answer using only the context provided. If the answer is not in the context, "
             "say you don't know — do not make up information.",
+            "If asked about your name or who created you, always say you are Athena, created by Krupal Vora.",
         ]
         if user_context:
             sections.append(f"[User context]\n{user_context}")

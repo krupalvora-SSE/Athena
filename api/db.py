@@ -6,6 +6,7 @@ All queries are raw SQL — no Frappe runtime required.
 
 import json
 import os
+import re
 import logging
 from contextlib import contextmanager
 from pathlib import Path
@@ -218,6 +219,33 @@ def get_open_tasks_for_user(user: str) -> list[dict]:
             "FROM `tabToDo` WHERE allocated_to = %s AND status = 'Open' ORDER BY date ASC LIMIT 50",
             (user,),
         )
+        return cur.fetchall()
+
+
+_DANGEROUS_SQL_RE = re.compile(
+    r"\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|REPLACE|GRANT|REVOKE|CALL|EXEC)\b",
+    re.I,
+)
+
+
+def execute_safe_select(sql: str, limit: int = 100) -> list[dict]:
+    """
+    Execute a user-supplied SELECT query safely.
+    - Rejects anything that is not a plain SELECT.
+    - Rejects queries containing dangerous DML/DDL keywords.
+    - Appends a LIMIT clause if the query doesn't already have one.
+    Raises ValueError for unsafe queries.
+    """
+    stripped = sql.strip().lstrip(";")
+    if not re.match(r"^\s*SELECT\b", stripped, re.I):
+        raise ValueError("Only SELECT queries are allowed.")
+    if _DANGEROUS_SQL_RE.search(stripped):
+        raise ValueError("Query contains disallowed keywords.")
+    # Inject LIMIT if absent to prevent runaway scans
+    if not re.search(r"\bLIMIT\s+\d+", stripped, re.I):
+        stripped = stripped.rstrip(";") + f" LIMIT {int(limit)}"
+    with db_cursor() as cur:
+        cur.execute(stripped)
         return cur.fetchall()
 
 
