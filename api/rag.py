@@ -39,14 +39,14 @@ class RAGPipeline:
 
     def _llm_invoke(self, prompt: str, retries: int = 3, delay: float = 3.0) -> str:
         """
-        Call self._llm_invoke() with retry-with-backoff.
+        Call self.llm.invoke() with retry-with-backoff.
         The native ollama client occasionally throws ConnectionError on the first
         call after container start — retrying recovers without surfacing a 500.
         """
         last_exc: Exception | None = None
         for attempt in range(1, retries + 1):
             try:
-                return self._llm_invoke(prompt)
+                return self.llm.invoke(prompt)
             except Exception as e:
                 last_exc = e
                 if attempt < retries:

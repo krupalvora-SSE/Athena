@@ -8,7 +8,7 @@ services:
       - ./db:/db:ro
     environment:
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
-      - OLLAMA_MODEL=qwen2.5:7b
+      - OLLAMA_MODEL=qwen2.5:3b
       - OLLAMA_EMBED_MODEL=nomic-embed-text
       - CHROMA_PERSIST_DIR=/chroma_data
       - DB_CONFIG_PATH=/db/config.json

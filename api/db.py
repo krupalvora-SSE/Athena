@@ -7,8 +7,10 @@ All queries are raw SQL — no Frappe runtime required.
 import json
 import os
 import re
+import uuid
 import logging
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -247,6 +249,69 @@ def execute_safe_select(sql: str, limit: int = 100) -> list[dict]:
     with db_cursor() as cur:
         cur.execute(stripped)
         return cur.fetchall()
+
+
+def log_chat(
+    user: str,
+    question: str,
+    answer: str,
+    session_id: str = "",
+    sources: list[str] | None = None,
+    current_doctype: str = "",
+    current_doc: str = "",
+    used_db: bool = False,
+) -> str | None:
+    """
+    Write a chat interaction directly to `tabAI Chat Log` in Frappe MariaDB.
+    Returns the generated document name on success, None on failure.
+
+    Frappe naming series: AICL-YYYY-MM-DD-NNNNN (generated locally — no Frappe runtime needed).
+    All fields mirror the tabAI Chat Log doctype columns observed via DESCRIBE.
+    """
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    date_part = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    suffix = uuid.uuid4().hex[:5].upper()
+    name = f"AICL-{date_part}-{suffix}"
+    sources_str = "\n".join(sources) if sources else ""
+
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO `tabAI Chat Log`
+                    (name, creation, modified, modified_by, owner, docstatus,
+                     user, question, answer, sources, session_id,
+                     current_doctype, current_doc, timestamp)
+                VALUES
+                    (%s, %s, %s, %s, %s, 0,
+                     %s, %s, %s, %s, %s,
+                     %s, %s, %s)
+                """,
+                (
+                    name, now, now, user, user,
+                    user, question, answer, sources_str, session_id or "",
+                    current_doctype or "", current_doc or "", now,
+                ),
+            )
+        return name
+    except Exception as e:
+        logger.warning(f"tabAI Chat Log write failed: {e}")
+        return None
+
+
+def get_chat_history(session_id: str, n: int = 15) -> list[dict]:
+    """
+    Return the last n turns for a session from tabAI Chat Log, oldest first.
+    Used by main.py to build conversation history for the LLM prompt.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT question, answer FROM `tabAI Chat Log` "
+            "WHERE session_id = %s ORDER BY creation DESC LIMIT %s",
+            (session_id, n),
+        )
+        rows = cur.fetchall()
+    return list(reversed(rows))
 
 
 def get_table_columns(table: str) -> list[str]:

@@ -83,8 +83,11 @@ _USER_ROLES_RE = re.compile(
     r"(my\s+roles?"
     r"|what\s+roles?\s+(do\s+i|i\s+have|does\s+\S+\s+have)"
     r"|list\s+(all\s+)?roles?"
-    r"|roles?\s+(i|for user|assigned to)"
-    r"|what\s+all\s+roles)",
+    r"|roles?\s+(i|for\s+user|assigned\s+to)"
+    r"|what\s+all\s+roles?"
+    r"|\bgive\s+(me\s+)?list\s+of\s+roles?"
+    r"|\broles?\s+(for|of)\s+user\b"
+    r"|\buser\b.{1,40}\broles?\b)",
     re.I,
 )
 _ACCESS_CHECK_RE = re.compile(
@@ -94,14 +97,19 @@ _ACCESS_CHECK_RE = re.compile(
 )
 _TASK_RE  = re.compile(r"\b(my\s+(open\s+)?tasks?|open\s+tasks?|todos?|assigned\s+to\s+me)\b", re.I)
 _STOCK_RE = re.compile(r"\b(stock|balance|qty|quantity|bin|warehouse|inventory)\b", re.I)
+# Bug fix: added transfer/move/shift to guard against process questions hitting stock handler
 _PROCESS_INTENT_RE = re.compile(
-    r"\b(process|how\s+to|how\s+do|steps?\s+to|procedure|way\s+to|method\s+to|what\s+is\s+the\s+step|next\s+step)\b",
+    r"\b(process|how\s+to|how\s+do|steps?\s+to|procedure|way\s+to|method\s+to"
+    r"|what\s+is\s+the\s+step|next\s+step|transfer|move|shift|create|make)\b",
     re.I,
 )
+# Bug fix: added lowercase "role <name>" pattern to catch "list of users having access to role system manager"
 _USERS_WITH_ROLE_RE = re.compile(
     r"(users?\s+(with|having|assigned|who\s+have)\s+(the\s+)?role"
     r"|list\s+(of\s+)?users?\s+(with|for|having)(\s+access\s+to)?\s+role"
-    r"|who\s+(has|have|is\s+assigned)\s+(the\s+)?role)",
+    r"|who\s+(has|have|is\s+assigned)\s+(the\s+)?role"
+    r"|\bhaving\s+access\s+to\s+role\b"
+    r"|\baccess\s+to\s+role\b)",
     re.I,
 )
 
@@ -109,13 +117,16 @@ _USERS_WITH_ROLE_RE = re.compile(
 _REFERS_BACK_RE = re.compile(r"\b(that|those|the same|it|its|their|this)\b", re.I)
 
 # Identity questions — answered directly without hitting the LLM
+# Bug fix: added hey/hi/hello athena so greetings don't fall to wrong handlers
 _IDENTITY_RE = re.compile(
     r"\b(what\s+is\s+your\s+name"
     r"|who\s+are\s+you"
     r"|what\s+are\s+you\s+called"
     r"|who\s+(made|created|built|developed)\s+you"
     r"|introduce\s+yourself"
-    r"|your\s+name)\b",
+    r"|your\s+name"
+    r"|hey\s+athena|hi\s+athena|hello\s+athena"
+    r"|hey\s+there|greetings)\b",
     re.I,
 )
 
@@ -140,10 +151,14 @@ _PENDING_APPROVALS_RE = re.compile(
 )
 
 # NL-to-SQL: patterns that signal the user wants a live DB query
+# Bug fix: added total number, count(*) literal, no of, # of patterns
 _NL_QUERY_RE = re.compile(
     r"(how\s+many\b"
     r"|\bcount\s+(of|all|\*)"
-    r"|\btotal\s+(number|count)\b"
+    r"|\bcount\s*\(\s*\*\s*\)"
+    r"|\btotal\s+(number|count|amount)\b"
+    r"|\bno\s+(of|\.)\s+\w"
+    r"|\bnumber\s+of\b"
     r"|\bquery\s+(the\s+)?(db|database|mariadb|mysql)\b"
     r"|\brun\s+(a\s+)?query\b"
     r"|\bselect\b.+\bfrom\b"
@@ -158,52 +173,8 @@ _DB_QUERY_ROLES = {
     "Purchase Manager", "Sales Manager",
 }
 
-# Schema cache — loaded once at container startup from MariaDB.
-# Keyed by full table name e.g. "tabDelivery Note" → [col1, col2, ...]
-_schema_cache: dict[str, list[str]] = {}
-
-
-def load_schema_from_db() -> None:
-    """
-    Called once during FastAPI lifespan startup.
-    Reads the full live schema from MariaDB (all tab* tables + custom fields)
-    and stores it in _schema_cache for NL-to-SQL use.
-    Re-runs on every container start so schema is always in sync with the DB.
-    """
-    global _schema_cache
-    try:
-        import db as _db
-        _schema_cache = _db.get_all_table_schemas()
-        logger.info(f"Schema cache ready: {len(_schema_cache)} tables.")
-    except Exception as e:
-        logger.warning(f"Schema load failed (NL queries will have no schema context): {e}")
-
-
-def _build_schema_block(question: str = "") -> str:
-    """
-    Build a compact schema string for the SQL prompt.
-    If a question is provided, only include tables whose names appear in the question
-    (or all tables if no match) to keep the prompt short.
-    """
-    if not _schema_cache:
-        return "(schema not loaded)"
-
-    # Try to narrow down to relevant tables based on words in the question
-    question_lower = question.lower()
-    relevant = {
-        t: cols for t, cols in _schema_cache.items()
-        # match on the doctype name part e.g. "delivery note" from "tabDelivery Note"
-        if t[3:].lower().replace(" ", "") in question_lower.replace(" ", "")
-        or any(alias.lower() in question_lower for alias, full in DOCTYPE_ALIASES.items() if f"tab{full}" == t)
-    }
-
-    # Fall back to full schema if nothing matched (covers vague questions)
-    tables = relevant if relevant else _schema_cache
-
-    lines = []
-    for table, cols in sorted(tables.items()):
-        lines.append(f"`{table}`: {', '.join(cols)}")
-    return "\n".join(lines)
+# SchemaRetriever is initialised in main.py lifespan and injected via route_query().
+# This avoids a circular import and keeps schema logic in one place.
 
 
 _SQL_GEN_PROMPT = """\
@@ -280,9 +251,10 @@ def _llm_classify(question: str, history: str = "") -> dict | None:
 # Router
 # ---------------------------------------------------------------------------
 
-def route_query(question: str, username: str, history: str = "") -> dict | None:
+def route_query(question: str, username: str, history: str = "", schema_retriever=None) -> dict | None:
     """
     Returns a result dict if a DB tool handles it, else None (fall through to RAG).
+    schema_retriever: optional SchemaRetriever instance for NL-to-SQL schema injection.
     """
     try:
         import db
@@ -333,7 +305,7 @@ def route_query(question: str, username: str, history: str = "") -> dict | None:
                 return result
 
         if _NL_QUERY_RE.search(question):
-            return _handle_nl_query(question, username, db)
+            return _handle_nl_query(question, username, db, schema_retriever)
 
     except Exception as e:
         logger.warning(f"DB tool (regex path) failed, trying LLM classifier: {e}")
@@ -345,14 +317,14 @@ def route_query(question: str, username: str, history: str = "") -> dict | None:
 
     try:
         import db
-        return _dispatch_classified(classification, question, username, db)
+        return _dispatch_classified(classification, question, username, db, schema_retriever)
     except Exception as e:
         logger.warning(f"DB tool (LLM path) failed, falling back to RAG: {e}")
 
     return None
 
 
-def _dispatch_classified(classification: dict, question: str, username: str, db) -> dict | None:
+def _dispatch_classified(classification: dict, question: str, username: str, db, schema_retriever=None) -> dict | None:
     intent = classification.get("intent", "rag")
     params = classification.get("params", {})
 
@@ -393,7 +365,7 @@ def _dispatch_classified(classification: dict, question: str, username: str, db)
         return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
 
     if intent == "db_query":
-        return _handle_nl_query(question, username, db)
+        return _handle_nl_query(question, username, db, schema_retriever)
 
     if intent == "pending_approvals":
         return _handle_pending_approvals(username, db)
@@ -448,8 +420,12 @@ def _extract_doctype_subject(question: str, history: str = "") -> str | None:
         question, re.I,
     )
     if m:
+        # Bug fix: strip trailing noise BEFORE resolving, so "Material Request too" → "Material Request"
         raw = _TRAILING_NOISE_RE.sub("", m.group(1)).strip()
-        return resolve_doctype(raw)
+        # Also strip common preposition noise at the start of the match
+        raw = re.sub(r"^(to|the|a|an)\s+", "", raw, flags=re.I).strip()
+        if raw:
+            return resolve_doctype(raw)
     # History fallback
     if history and _REFERS_BACK_RE.search(question):
         for abbr in DOCTYPE_ALIASES:
@@ -658,12 +634,13 @@ def _handle_pending_approvals(username: str, db) -> dict:
     }
 
 
-def _handle_nl_query(question: str, username: str, db) -> dict:
+def _handle_nl_query(question: str, username: str, db, schema_retriever=None) -> dict:
     """
     Natural-language → SQL handler.
     1. Checks the user has a role in _DB_QUERY_ROLES.
-    2. Uses the LLM to generate a SELECT query.
-    3. Validates + executes it via db.execute_safe_select().
+    2. Retrieves relevant table schemas via SchemaRetriever (semantic search).
+    3. Uses the LLM to generate a SELECT query with real columns injected.
+    4. Validates + executes it via db.execute_safe_select().
     """
     # --- Access gate ---
     user_roles = set(db.get_user_roles(username))
@@ -676,8 +653,13 @@ def _handle_nl_query(question: str, username: str, db) -> dict:
             "sources": [],
         }
 
-    # --- Generate SQL with real column names injected (schema loaded at startup) ---
-    prompt = _SQL_GEN_PROMPT.format(schema=_build_schema_block(question), question=question)
+    # --- Retrieve relevant schema via semantic search ---
+    if schema_retriever and schema_retriever.is_ready():
+        schema = schema_retriever.get_relevant_schemas(question)
+    else:
+        schema = "(schema not available — run index_schema.py)"
+
+    prompt = _SQL_GEN_PROMPT.format(schema=schema, question=question)
     try:
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
@@ -727,16 +709,28 @@ def _handle_stock(question: str, db, history: str = "") -> dict:
     limit_match = re.search(r"\btop\s+(\d+)\b", question, re.I)
     limit = int(limit_match.group(1)) if limit_match else None
 
-    # Try "item code XXXX YYYY" pattern first (explicit)
-    m = re.search(r"\bitem\s+code\s+([A-Z0-9][A-Z0-9 \-]+?)(?:\s+in\b|\s+at\b|\s+for\b|\?|$)", question, re.I)
+    # Try "item code XXXX YYYY ZZZZ" — greedy up to a warehouse/location delimiter or end
+    # Bug fix: previous regex stopped at first space; now captures full multi-word item codes
+    m = re.search(
+        r"\bitem\s+(?:code\s+)?([A-Z0-9][A-Z0-9 \-\.]+?)(?:\s+in\b|\s+at\b|\s+for\b|\s+warehouse|\?|$)",
+        question, re.I,
+    )
     if m:
         item_code = m.group(1).strip()
     else:
-        # Try uppercase-only token (classic Frappe item codes like SLR-100W)
-        item_match = re.search(r"\b([A-Z][A-Z0-9\-]{2,})\b", question)
-        if not item_match and history:
-            item_match = re.search(r"\b([A-Z][A-Z0-9\-]{2,})\b", history)
-        item_code = item_match.group(1) if item_match else None
+        # Try "stock of <item>" / "stock for <item>" patterns
+        m2 = re.search(
+            r"\b(?:stock|balance|qty|quantity)\s+(?:of|for)\s+([A-Z0-9][A-Z0-9 \-\.]+?)(?:\s+in\b|\s+at\b|\?|$)",
+            question, re.I,
+        )
+        if m2:
+            item_code = m2.group(1).strip()
+        else:
+            # Try uppercase-only token (classic Frappe codes like SLR-100W — no spaces)
+            item_match = re.search(r"\b([A-Z][A-Z0-9\-\.]{2,})\b", question)
+            if not item_match and history:
+                item_match = re.search(r"\b([A-Z][A-Z0-9\-\.]{2,})\b", history)
+            item_code = item_match.group(1) if item_match else None
 
     # If we have a code, look it up directly
     if item_code:
