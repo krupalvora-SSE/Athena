@@ -50,7 +50,7 @@ def get_connection() -> pymysql.Connection:
         database=os.getenv("DB_NAME", cfg.get("db_name", "")),
         charset="utf8mb4",
         cursorclass=pymysql.cursors.DictCursor,
-        connect_timeout=5,
+        connect_timeout=10,
     )
 
 
@@ -247,6 +247,21 @@ def execute_safe_select(sql: str, limit: int = 100) -> list[dict]:
     with db_cursor() as cur:
         cur.execute(stripped)
         return cur.fetchall()
+
+
+def get_table_columns(table: str) -> list[str]:
+    """
+    Return column names for a Frappe table via DESCRIBE.
+    `table` should be the full table name e.g. 'tabDelivery Note'.
+    Returns [] if the table doesn't exist.
+    """
+    with db_cursor() as cur:
+        try:
+            cur.execute(f"DESCRIBE `{table}`")
+            rows = cur.fetchall()
+            return [r["Field"] for r in rows]
+        except Exception:
+            return []
 
 
 def get_document(doctype: str, docname: str) -> dict | None:

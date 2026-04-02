@@ -158,15 +158,73 @@ _DB_QUERY_ROLES = {
     "Purchase Manager", "Sales Manager",
 }
 
+# Tables whose real columns are fetched from the DB and injected into the SQL prompt.
+# This prevents the LLM from hallucinating column names that don't exist.
+_SCHEMA_TABLES = [
+    "tabDelivery Note",
+    "tabSales Order",
+    "tabPurchase Order",
+    "tabPurchase Invoice",
+    "tabSales Invoice",
+    "tabStock Entry",
+    "tabMaterial Request",
+    "tabPurchase Receipt",
+    "tabWork Order",
+    "tabBOM",
+    "tabPayment Entry",
+    "tabJournal Entry",
+    "tabBin",
+    "tabUser",
+    "tabItem",
+]
+
+# Lazy schema cache — populated on first NL query, never re-fetched during the process lifetime.
+_schema_cache: dict[str, list[str]] = {}
+_schema_loaded: bool = False
+
+
+def _ensure_schema_loaded(db) -> None:
+    """
+    Fetch real column names from the DB for every table in _SCHEMA_TABLES.
+    No-op after the first successful load.
+    """
+    global _schema_loaded
+    if _schema_loaded:
+        return
+    for table in _SCHEMA_TABLES:
+        cols = db.get_table_columns(table)
+        if cols:
+            _schema_cache[table] = cols
+    _schema_loaded = True
+    logger.info(f"Schema cache loaded for {len(_schema_cache)} tables.")
+
+
+def _build_schema_block() -> str:
+    """
+    Format cached column names into a compact block for the SQL prompt.
+    Internal Frappe housekeeping columns (_user_tags, _comments, etc.) are excluded
+    to keep the prompt focused on queryable business fields.
+    """
+    _INTERNAL = {"_user_tags", "_comments", "_assign", "_liked_by", "idx"}
+    lines = []
+    for table, cols in sorted(_schema_cache.items()):
+        visible = [c for c in cols if c not in _INTERNAL]
+        lines.append(f"`{table}`: {', '.join(visible)}")
+    return "\n".join(lines)
+
+
 _SQL_GEN_PROMPT = """\
 You are a MariaDB SQL expert for a Frappe/ERPNext system.
 Frappe naming convention: DocType "Delivery Note" → table `tabDelivery Note`.
 
 Common docstatus values: 0 = Draft, 1 = Submitted, 2 = Cancelled.
-Common tables: `tabDelivery Note`, `tabSales Order`, `tabPurchase Order`,
-  `tabPurchase Invoice`, `tabSales Invoice`, `tabStock Entry`,
-  `tabMaterial Request`, `tabPurchase Receipt`, `tabWork Order`,
-  `tabBOM`, `tabPayment Entry`, `tabJournal Entry`, `tabUser`, `tabBin`.
+
+IMPORTANT: Use ONLY the column names listed below. Do NOT invent columns.
+If a concept (e.g. "internal supplier") is not in the column list, use the closest
+real column or omit that filter and note it in a comment.
+
+Real table schemas (table: col1, col2, ...):
+{schema}
 
 Write a single safe SELECT query for the following question.
 - Use COUNT(*) or COUNT(`name`) for totals.
@@ -213,7 +271,7 @@ def _llm_classify(question: str, history: str = "") -> dict | None:
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False, "format": "json"},
-            timeout=8.0,
+            timeout=30.0,
         )
         resp.raise_for_status()
         raw = resp.json().get("response", "")
@@ -625,13 +683,16 @@ def _handle_nl_query(question: str, username: str, db) -> dict:
             "sources": [],
         }
 
-    # --- Generate SQL ---
-    prompt = _SQL_GEN_PROMPT.format(question=question)
+    # --- Load real schema (no-op after first call) ---
+    _ensure_schema_loaded(db)
+
+    # --- Generate SQL with real column names injected ---
+    prompt = _SQL_GEN_PROMPT.format(schema=_build_schema_block(), question=question)
     try:
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",
             json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-            timeout=30.0,
+            timeout=120.0,
         )
         resp.raise_for_status()
         sql = resp.json().get("response", "").strip()

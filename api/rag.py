@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import logging
 import httpx
 from langchain_ollama import OllamaLLM
@@ -36,12 +37,33 @@ class RAGPipeline:
         self._ready = False
         self._setup()
 
+    def _llm_invoke(self, prompt: str, retries: int = 3, delay: float = 3.0) -> str:
+        """
+        Call self._llm_invoke() with retry-with-backoff.
+        The native ollama client occasionally throws ConnectionError on the first
+        call after container start — retrying recovers without surfacing a 500.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, retries + 1):
+            try:
+                return self._llm_invoke(prompt)
+            except Exception as e:
+                last_exc = e
+                if attempt < retries:
+                    logger.warning(
+                        f"Ollama LLM call failed (attempt {attempt}/{retries}): {e}. "
+                        f"Retrying in {delay}s…"
+                    )
+                    time.sleep(delay)
+        raise RuntimeError(f"Ollama LLM unavailable after {retries} attempts: {last_exc}")
+
     def _setup(self):
         logger.info(f"Connecting to Ollama at {OLLAMA_BASE_URL} with model {OLLAMA_MODEL}")
         self.llm = OllamaLLM(
             base_url=OLLAMA_BASE_URL,
             model=OLLAMA_MODEL,
             temperature=0.1,
+            request_timeout=180.0,
         )
         self.embeddings = OllamaEmbeddings(
             base_url=OLLAMA_BASE_URL,
@@ -124,7 +146,7 @@ class RAGPipeline:
             resp = httpx.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
                 json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                timeout=10.0,
+                timeout=30.0,
             )
             resp.raise_for_status()
             rewritten = resp.json().get("response", "").strip().strip('"').strip("'")
@@ -157,7 +179,7 @@ class RAGPipeline:
             resp = httpx.post(
                 f"{OLLAMA_BASE_URL}/api/generate",
                 json={"model": OLLAMA_MODEL, "prompt": prompt, "stream": False},
-                timeout=12.0,
+                timeout=30.0,
             )
             resp.raise_for_status()
             summary = resp.json().get("response", "").strip()
@@ -216,7 +238,14 @@ class RAGPipeline:
         full_prompt = "\n\n".join(sections)
 
         # 7. Call LLM directly (embedding stays short — history/context not passed to embedder)
-        answer = self.llm.invoke(full_prompt)
+        try:
+            answer = self._llm_invoke(full_prompt)
+        except RuntimeError as e:
+            logger.error(f"LLM unavailable: {e}")
+            return {
+                "answer": "I'm temporarily unavailable — the AI model is not responding. Please try again in a moment.",
+                "sources": [],
+            }
 
         sources = []
         for doc in docs:
