@@ -1,0 +1,21 @@
+# Credentials
+db/config.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.venv/
+venv/
+
+# Data / DB
+chroma_data/
+*.db
+*.sqlite
+
+# Docker
+*.log
+
+# OS
+.DS_Store
