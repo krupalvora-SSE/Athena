@@ -158,58 +158,51 @@ _DB_QUERY_ROLES = {
     "Purchase Manager", "Sales Manager",
 }
 
-# Tables whose real columns are fetched from the DB and injected into the SQL prompt.
-# This prevents the LLM from hallucinating column names that don't exist.
-_SCHEMA_TABLES = [
-    "tabDelivery Note",
-    "tabSales Order",
-    "tabPurchase Order",
-    "tabPurchase Invoice",
-    "tabSales Invoice",
-    "tabStock Entry",
-    "tabMaterial Request",
-    "tabPurchase Receipt",
-    "tabWork Order",
-    "tabBOM",
-    "tabPayment Entry",
-    "tabJournal Entry",
-    "tabBin",
-    "tabUser",
-    "tabItem",
-]
-
-# Lazy schema cache — populated on first NL query, never re-fetched during the process lifetime.
+# Schema cache — loaded once at container startup from MariaDB.
+# Keyed by full table name e.g. "tabDelivery Note" → [col1, col2, ...]
 _schema_cache: dict[str, list[str]] = {}
-_schema_loaded: bool = False
 
 
-def _ensure_schema_loaded(db) -> None:
+def load_schema_from_db() -> None:
     """
-    Fetch real column names from the DB for every table in _SCHEMA_TABLES.
-    No-op after the first successful load.
+    Called once during FastAPI lifespan startup.
+    Reads the full live schema from MariaDB (all tab* tables + custom fields)
+    and stores it in _schema_cache for NL-to-SQL use.
+    Re-runs on every container start so schema is always in sync with the DB.
     """
-    global _schema_loaded
-    if _schema_loaded:
-        return
-    for table in _SCHEMA_TABLES:
-        cols = db.get_table_columns(table)
-        if cols:
-            _schema_cache[table] = cols
-    _schema_loaded = True
-    logger.info(f"Schema cache loaded for {len(_schema_cache)} tables.")
+    global _schema_cache
+    try:
+        import db as _db
+        _schema_cache = _db.get_all_table_schemas()
+        logger.info(f"Schema cache ready: {len(_schema_cache)} tables.")
+    except Exception as e:
+        logger.warning(f"Schema load failed (NL queries will have no schema context): {e}")
 
 
-def _build_schema_block() -> str:
+def _build_schema_block(question: str = "") -> str:
     """
-    Format cached column names into a compact block for the SQL prompt.
-    Internal Frappe housekeeping columns (_user_tags, _comments, etc.) are excluded
-    to keep the prompt focused on queryable business fields.
+    Build a compact schema string for the SQL prompt.
+    If a question is provided, only include tables whose names appear in the question
+    (or all tables if no match) to keep the prompt short.
     """
-    _INTERNAL = {"_user_tags", "_comments", "_assign", "_liked_by", "idx"}
+    if not _schema_cache:
+        return "(schema not loaded)"
+
+    # Try to narrow down to relevant tables based on words in the question
+    question_lower = question.lower()
+    relevant = {
+        t: cols for t, cols in _schema_cache.items()
+        # match on the doctype name part e.g. "delivery note" from "tabDelivery Note"
+        if t[3:].lower().replace(" ", "") in question_lower.replace(" ", "")
+        or any(alias.lower() in question_lower for alias, full in DOCTYPE_ALIASES.items() if f"tab{full}" == t)
+    }
+
+    # Fall back to full schema if nothing matched (covers vague questions)
+    tables = relevant if relevant else _schema_cache
+
     lines = []
-    for table, cols in sorted(_schema_cache.items()):
-        visible = [c for c in cols if c not in _INTERNAL]
-        lines.append(f"`{table}`: {', '.join(visible)}")
+    for table, cols in sorted(tables.items()):
+        lines.append(f"`{table}`: {', '.join(cols)}")
     return "\n".join(lines)
 
 
@@ -683,11 +676,8 @@ def _handle_nl_query(question: str, username: str, db) -> dict:
             "sources": [],
         }
 
-    # --- Load real schema (no-op after first call) ---
-    _ensure_schema_loaded(db)
-
-    # --- Generate SQL with real column names injected ---
-    prompt = _SQL_GEN_PROMPT.format(schema=_build_schema_block(), question=question)
+    # --- Generate SQL with real column names injected (schema loaded at startup) ---
+    prompt = _SQL_GEN_PROMPT.format(schema=_build_schema_block(question), question=question)
     try:
         resp = httpx.post(
             f"{OLLAMA_BASE_URL}/api/generate",

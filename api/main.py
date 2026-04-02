@@ -6,7 +6,7 @@ import sqlite3
 import os
 
 from rag import RAGPipeline
-from tools import route_query, wants_sources
+from tools import route_query, wants_sources, load_schema_from_db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -110,6 +110,8 @@ def _build_user_context(username: str) -> str:
 async def lifespan(app: FastAPI):
     global rag
     _init_chat_log()
+    logger.info("Syncing DB schema...")
+    load_schema_from_db()
     logger.info("Loading RAG pipeline...")
     rag = RAGPipeline()
     logger.info("RAG pipeline ready.")

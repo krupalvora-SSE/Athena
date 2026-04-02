@@ -264,6 +264,64 @@ def get_table_columns(table: str) -> list[str]:
             return []
 
 
+def get_all_table_schemas() -> dict[str, list[str]]:
+    """
+    Load real column names for every DocType table that exists in the DB,
+    plus all custom fields from tabCustom Field.
+
+    Returns a dict: { "tabDelivery Note": ["name", "supplier", ...], ... }
+
+    Called once at container startup so NL-to-SQL always has fresh, accurate schema.
+    """
+    _INTERNAL = {"_user_tags", "_comments", "_assign", "_liked_by", "idx"}
+
+    # 1. Discover all tables that follow Frappe's `tab*` naming convention
+    with db_cursor() as cur:
+        cur.execute("SHOW TABLES")
+        all_tables = [list(row.values())[0] for row in cur.fetchall()]
+
+    tab_tables = [t for t in all_tables if t.startswith("tab")]
+
+    # 2. DESCRIBE each table — skip system/log tables to keep the schema compact
+    _SKIP_SUFFIXES = (
+        " Log", " Version", " Activity", " Feed", " Notification",
+        " Hook", " Patch", "DocShare", "DocField", "DocPerm",
+    )
+    schema: dict[str, list[str]] = {}
+    with db_cursor() as cur:
+        for table in tab_tables:
+            if any(table.endswith(s) for s in _SKIP_SUFFIXES):
+                continue
+            try:
+                cur.execute(f"DESCRIBE `{table}`")
+                cols = [
+                    r["Field"] for r in cur.fetchall()
+                    if r["Field"] not in _INTERNAL
+                ]
+                if cols:
+                    schema[table] = cols
+            except Exception:
+                continue
+
+    # 3. Overlay custom fields so per-company additions are visible
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT dt, fieldname FROM `tabCustom Field` "
+                " ORDER BY dt, idx"
+            )
+            for row in cur.fetchall():
+                tbl = f"tab{row['dt']}"
+                if tbl in schema and row["fieldname"] not in schema[tbl]:
+                    schema[tbl].append(row["fieldname"])
+    except Exception as e:
+        logger.warning(f"Could not load custom fields: {e}")
+
+    logger.info(f"Schema loaded: {len(schema)} tables, "
+                f"{sum(len(v) for v in schema.values())} total columns.")
+    return schema
+
+
 def get_document(doctype: str, docname: str) -> dict | None:
     """
     Fetch all fields of a Frappe document by doctype and name.
