@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 rag: RAGPipeline | None = None
 
 CHAT_LOG_DB = os.getenv("CHAT_LOG_DB", "/chroma_data/chat_logs.db")
-HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "6"))   # number of past turns to inject
+HISTORY_TURNS = int(os.getenv("HISTORY_TURNS", "15"))  # number of past turns to inject
 
 
 # ---------------------------------------------------------------------------

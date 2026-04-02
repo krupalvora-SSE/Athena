@@ -249,6 +249,51 @@ def execute_safe_select(sql: str, limit: int = 100) -> list[dict]:
         return cur.fetchall()
 
 
+def get_document(doctype: str, docname: str) -> dict | None:
+    """
+    Fetch all fields of a Frappe document by doctype and name.
+    Returns a flat dict, or None if not found.
+    """
+    table = f"tab{doctype}"
+    with db_cursor() as cur:
+        cur.execute(f"SELECT * FROM `{table}` WHERE name = %s LIMIT 1", (docname,))
+        return cur.fetchone()
+
+
+def get_pending_approvals(user: str) -> list[dict]:
+    """
+    Return documents pending this user's action via tabWorkflow Action.
+    Returns an empty list if the table doesn't exist (older Frappe versions).
+    """
+    with db_cursor() as cur:
+        try:
+            cur.execute(
+                "SELECT document_type, document_name, action, workflow_state, creation "
+                "FROM `tabWorkflow Action` "
+                "WHERE user = %s AND status = 'Open' ORDER BY creation ASC LIMIT 50",
+                (user,),
+            )
+            return cur.fetchall()
+        except Exception:
+            return []
+
+
+def search_items_by_name(term: str, limit: int = 5) -> list[dict]:
+    """
+    Fuzzy-search tabItem by item_code or item_name.
+    Returns list of {item_code, item_name} dicts (disabled items excluded).
+    """
+    like = f"%{term}%"
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT item_code, item_name FROM `tabItem` "
+            "WHERE (item_code LIKE %s OR item_name LIKE %s) AND disabled = 0 "
+            "ORDER BY item_name LIMIT %s",
+            (like, like, limit),
+        )
+        return cur.fetchall()
+
+
 def search_doctype(doctype: str, filters: dict[str, Any], fields: list[str] | None = None, limit: int = 20) -> list[dict]:
     """
     Generic single-table fetch.

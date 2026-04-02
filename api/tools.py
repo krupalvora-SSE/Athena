@@ -119,6 +119,26 @@ _IDENTITY_RE = re.compile(
     re.I,
 )
 
+# Document detail lookup: "show me SO-2024-00123", "details of PO-2024-001"
+_DOC_LOOKUP_RE = re.compile(
+    r"(show\s+(me\s+)?|details?\s+(of\s+|for\s+)?|open\s+|fetch\s+|get\s+|what\s+is\s+)"
+    r"([A-Z][A-Z0-9]{0,4}-\d{4}-\d{3,6})",
+    re.I,
+)
+# Also catch bare docnames like "PO-2024-00123" anywhere in the message
+_DOCNAME_RE = re.compile(r"\b([A-Z][A-Z0-9]{0,4}-\d{4}-\d{3,6})\b")
+
+# Pending approvals: "pending my approval", "what needs approval", etc.
+_PENDING_APPROVALS_RE = re.compile(
+    r"(pending\s+(my\s+)?approval"
+    r"|what\s+(needs|requires)\s+(my\s+)?approval"
+    r"|documents?\s+(to|for)\s+approv"
+    r"|approval\s+queue"
+    r"|waiting\s+for\s+my\s+approval"
+    r"|\bmy\s+approvals?\b)",
+    re.I,
+)
+
 # NL-to-SQL: patterns that signal the user wants a live DB query
 _NL_QUERY_RE = re.compile(
     r"(how\s+many\b"
@@ -174,6 +194,8 @@ Intents:
 - stock: asking about stock or inventory balance for an item. params: item_code
 - users_with_role: asking which users have a specific role. params: {{"role": "role name"}}
 - db_query: asking for a live count, total, or data query against the ERP database. params: {{}}
+- pending_approvals: asking what documents are pending the user's approval or action. params: {{}}
+- doc_lookup: asking to show or fetch details of a specific document by its name (e.g. SO-2024-00123). params: {{"docname": "..."}}
 - rag: general ERP documentation or process question not covered above. params: {{}}
 
 Recent conversation history (may be empty):
@@ -251,6 +273,14 @@ def route_query(question: str, username: str, history: str = "") -> dict | None:
         if _STOCK_RE.search(question) and not _PROCESS_INTENT_RE.search(question):
             return _handle_stock(question, db, history)
 
+        if _PENDING_APPROVALS_RE.search(question):
+            return _handle_pending_approvals(username, db)
+
+        if _DOC_LOOKUP_RE.search(question) or _DOCNAME_RE.search(question):
+            result = _handle_document_lookup(question, db)
+            if result:
+                return result
+
         if _NL_QUERY_RE.search(question):
             return _handle_nl_query(question, username, db)
 
@@ -313,6 +343,12 @@ def _dispatch_classified(classification: dict, question: str, username: str, db)
 
     if intent == "db_query":
         return _handle_nl_query(question, username, db)
+
+    if intent == "pending_approvals":
+        return _handle_pending_approvals(username, db)
+
+    if intent == "doc_lookup":
+        return _handle_document_lookup(question, db)
 
     return None
 
@@ -503,6 +539,74 @@ def _handle_users_with_role(question: str, db) -> dict:
     return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
 
 
+def _handle_document_lookup(question: str, db) -> dict | None:
+    """
+    Fetch and display key fields of a specific Frappe document by name.
+    Resolves doctype from the docname prefix (SO → Sales Order, etc.).
+    """
+    m = _DOCNAME_RE.search(question)
+    if not m:
+        return None
+    docname = m.group(1)
+    prefix = docname.split("-")[0].upper()
+    doctype = DOCTYPE_ALIASES.get(prefix)
+    if not doctype:
+        return {"answer": f"I don't recognise the document prefix **{prefix}**. Please specify the full doctype.", "sources": []}
+
+    try:
+        row = db.get_document(doctype, docname)
+    except Exception as e:
+        return {"answer": f"Could not fetch **{docname}**: {e}", "sources": []}
+
+    if not row:
+        return {"answer": f"Document **{docname}** not found in **{doctype}**.", "sources": []}
+
+    # Display a curated subset of fields — skip internal/long fields
+    _SKIP = {"amended_from", "idx", "doctype", "_user_tags", "_comments", "_assign",
+              "_liked_by", "naming_series"}
+    _LONG_FIELDS = {"description", "terms", "instructions", "remarks", "note"}
+
+    lines = []
+    for k, v in row.items():
+        if k.startswith("_") or k in _SKIP or v is None or v == "":
+            continue
+        if k in _LONG_FIELDS and isinstance(v, str) and len(v) > 120:
+            v = v[:120] + "…"
+        lines.append(f"- **{k}**: {v}")
+
+    docstatus_map = {0: "Draft", 1: "Submitted", 2: "Cancelled"}
+    if "docstatus" in row:
+        lines = [f"- **Status**: {docstatus_map.get(row['docstatus'], row['docstatus'])}"] + [
+            l for l in lines if "docstatus" not in l
+        ]
+
+    return {
+        "answer": f"**{doctype}** — {docname}\n\n" + "\n".join(lines),
+        "sources": [],
+    }
+
+
+def _handle_pending_approvals(username: str, db) -> dict:
+    """Return documents pending the user's approval via Workflow Actions."""
+    try:
+        rows = db.get_pending_approvals(username)
+    except Exception as e:
+        return {"answer": f"Could not fetch pending approvals: {e}", "sources": []}
+
+    if not rows:
+        return {"answer": f"No documents are pending your approval, **{username}**.", "sources": []}
+
+    lines = []
+    for r in rows:
+        state = f" [{r['workflow_state']}]" if r.get("workflow_state") else ""
+        lines.append(f"- **{r['document_type']}** — {r['document_name']}{state} (action: {r.get('action', '?')})")
+
+    return {
+        "answer": f"Documents pending your approval ({len(lines)}):\n" + "\n".join(lines),
+        "sources": [],
+    }
+
+
 def _handle_nl_query(question: str, username: str, db) -> dict:
     """
     Natural-language → SQL handler.
@@ -572,20 +676,73 @@ def _handle_stock(question: str, db, history: str = "") -> dict:
     limit_match = re.search(r"\btop\s+(\d+)\b", question, re.I)
     limit = int(limit_match.group(1)) if limit_match else None
 
-    # Try "item code XXXX YYYY" pattern first
+    # Try "item code XXXX YYYY" pattern first (explicit)
     m = re.search(r"\bitem\s+code\s+([A-Z0-9][A-Z0-9 \-]+?)(?:\s+in\b|\s+at\b|\s+for\b|\?|$)", question, re.I)
     if m:
         item_code = m.group(1).strip()
     else:
-        # Fall back to uppercase-only token (no spaces)
+        # Try uppercase-only token (classic Frappe item codes like SLR-100W)
         item_match = re.search(r"\b([A-Z][A-Z0-9\-]{2,})\b", question)
         if not item_match and history:
             item_match = re.search(r"\b([A-Z][A-Z0-9\-]{2,})\b", history)
         item_code = item_match.group(1) if item_match else None
 
-    if not item_code:
-        return {"answer": "Please specify an item code to check stock balance.", "sources": []}
-    return _format_stock(item_code, db.get_stock_balance(item_code), limit)
+    # If we have a code, look it up directly
+    if item_code:
+        rows = db.get_stock_balance(item_code)
+        if rows:
+            return _format_stock(item_code, rows, limit)
+        # Exact match found no stock — try fuzzy to check if the code is slightly off
+        suggestions = db.search_items_by_name(item_code)
+        if suggestions:
+            lines = "\n".join(f"- **{s['item_code']}** — {s['item_name']}" for s in suggestions)
+            return {
+                "answer": (
+                    f"No stock records found for **{item_code}**. "
+                    f"Did you mean one of these?\n{lines}"
+                ),
+                "sources": [],
+            }
+        return _format_stock(item_code, [], limit)
+
+    # No code extracted — try fuzzy name search from the question text
+    # Strip common stop words and ERP noise to get a meaningful search term
+    _NOISE_RE = re.compile(
+        r"\b(stock|balance|qty|quantity|bin|warehouse|inventory|check|show|what|is|the|of|for|in|at|how|much|many)\b",
+        re.I,
+    )
+    search_term = _NOISE_RE.sub("", question).strip(" ?")
+    search_term = re.sub(r"\s{2,}", " ", search_term).strip()
+
+    if len(search_term) >= 3:
+        try:
+            suggestions = db.search_items_by_name(search_term)
+        except Exception:
+            suggestions = []
+
+        if len(suggestions) == 1:
+            # Only one match — use it directly
+            item_code = suggestions[0]["item_code"]
+            return _format_stock(item_code, db.get_stock_balance(item_code), limit)
+
+        if suggestions:
+            lines = "\n".join(f"- **{s['item_code']}** — {s['item_name']}" for s in suggestions)
+            return {
+                "answer": (
+                    f"I found multiple items matching **{search_term}**. "
+                    f"Which one did you mean?\n{lines}\n\n"
+                    "Reply with the exact item code to get the stock balance."
+                ),
+                "sources": [],
+            }
+
+    return {
+        "answer": (
+            "Please specify an item code or name to check stock balance. "
+            "Example: *stock balance for item code SLR-100W* or *stock of Solar Panel 100W*"
+        ),
+        "sources": [],
+    }
 
 
 # ---------------------------------------------------------------------------
