@@ -16,7 +16,7 @@ Chat UI  ──►  FastAPI (/chat)
                   │       • Document lookup (SO-2024-001, DN-2024-005, etc.)
                   │       • Natural language → SELECT queries
                   │
-                  ├── LLM Classifier  (Ollama qwen2.5:3b, JSON mode, fallback)
+                  ├── LLM Classifier  (Ollama qwen2.5:7b, JSON mode, fallback)
                   │       ↓ if intent matched
                   ├── DB Tools  (PyMySQL → Frappe MariaDB, read-only)
                   │       • tabHas Role, tabDocPerm, tabCustom DocPerm

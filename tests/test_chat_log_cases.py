@@ -391,3 +391,81 @@ def test_bug_summary(capsys):
             print(f"[FIXED] {b['id']} ({b['log']}): {b['description']}")
         print(f"{'='*60}")
     assert len(open_bugs) == 0, f"Bug count changed — update KNOWN_BUGS list"  # noqa: E501
+
+
+'''
+Functional Queries (What does / how to use)
+Purchase & GRN
+
+What are the custom fields on GRN?
+What is the workflow for Purchase Receipt approval?
+Which roles can approve a Purchase Order?
+What happens when a GRN is submitted — what GL entries are created?
+How is MSME flag used on a Purchase Order?
+What is the difference between load_type and dispatch_status on a GRN?
+Delivery Note & Sales
+7. What custom fields are available on Delivery Note?
+8. How does custom_picked_up field work on DN?
+9. What triggers the valuation amount calculation on a Delivery Note item?
+10. What roles can cancel a Delivery Note?
+11. What is the workflow on DN — which states exist?
+
+Stock & BOM
+12. What does Reserve for Project stock entry type do?
+13. How is BOM percentage completion tracked?
+14. What is the purpose of BOM Item-is_committed field?
+15. What custom fields exist on BOM?
+
+General
+16. What roles does a user need to submit a Material Request?
+17. What is VSR doctype and what is it used for?
+18. What is the purpose of the Proforma Invoice custom doctype?
+19. How does budget variance work in this system?
+20. What is PKL and how is it linked to BOM?
+
+🔴 Support Queries (Errors while submitting / using)
+Workflow & Permission errors
+
+I am getting "Not permitted" when trying to submit a Purchase Order — what roles do I need?
+Why is the Submit button not visible on my GRN?
+I cannot cancel a Delivery Note — it says workflow state does not allow it. What should I do?
+Why is the approved_by field mandatory on BOM before submit?
+My Material Request is stuck in Draft — which role needs to approve it?
+Validation errors
+6. I get "UOM mismatch" error while submitting a Purchase Order — what causes this?
+7. Why does my Stock Entry fail with "BOM validation failed on submit"?
+8. I am getting an error about billing_gst_no while saving a Purchase Order — what is this field?
+9. Why does the system throw an error when I try to cancel a GRN that has a JE linked to it?
+10. My Sales Invoice validation is failing — what validations run before submit?
+
+Data issues
+11. GRN was submitted but no JE was created — what conditions trigger JE creation on GRN submit?
+12. Delivery Note was submitted but material_request field is not getting updated — why?
+13. Payment Entry submission failed with party type error — what is mandatory?
+14. I submitted a Stock Entry but the BOM percentage did not update — what triggers that?
+15. Why is rate field read-only on Purchase Receipt Item?
+
+🔵 Developer Queries (Logic, hooks, customisations)
+Hooks & Events
+
+Which Python function runs on before_submit of Purchase Receipt?
+What does capture_workflow_timestamps do on Purchase Receipt?
+Which hooks are defined for Delivery Note on_submit?
+What does before_insert on Stock Entry do?
+What override is applied to make_purchase_receipt from Purchase Order?
+Custom Scripts & Logic
+6. How does update_approver work and which doctypes use it?
+7. What does validate_uom check and on which doctypes is it called?
+8. How is account_srbnb on Item Group used during GRN JE creation?
+9. What does custom_buying_controller monkey patch do?
+10. How does the autoname override work on Purchase Order?
+
+API & Integration
+11. What does the OMS project sync API do?
+12. How does the Razorpay payment integration work in this app?
+13. What does dump_reports_to_postgres scheduled job do?
+14. How does the Yes Bank (yb) integration work?
+15. What is the el_api endpoint used for and when is it called?
+
+These 45 queries cover the full spectrum — start with a mix of easy functional ones to validate routing, then escalate to the support and developer queries to stress-test context awareness (especially with current_doctype + current_doc set).
+'''
