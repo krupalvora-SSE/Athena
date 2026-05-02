@@ -207,6 +207,7 @@ class RAGPipeline:
                     "Please check with your ERP administrator or the official Frappe/ERPNext docs."
                 ),
                 "sources": [],
+                "_route": "rag/no_relevance",
             }
 
         # 2. Condense long history
@@ -227,6 +228,18 @@ class RAGPipeline:
             "Answer using only the context provided. If the answer is not in the context, "
             "say you don't know — do not make up information.",
             "If asked about your name or who created you, always say you are Athena, created by Krupal Vora.",
+            # Anti-hallucination guardrail: workflow/transition/approval questions must
+            # come from a workflow handler (live DB), not docs. Refuse rather than guess.
+            "If the question is about a *workflow*, *transition*, *approval flow*, or "
+            "*who can approve* a doctype, do NOT invent states like 'Draft / Submitted / "
+            "Cancelled'. Instead reply: \"I don't have the workflow definition for this "
+            "in my docs — try asking 'workflow of <DocType>' so I can pull it from the "
+            "live system.\"",
+            # Bound the answer to the retrieved chunks: if the chunks do not name the "
+            # doctype the user asked about, say so plainly.
+            "If the [Context from docs] does not contain the specific DocType, feature, "
+            "or term the user named, reply: \"I don't have docs covering this exactly — "
+            "could you rephrase?\" Do not extrapolate.",
         ]
         if user_context:
             sections.append(f"[User context]\n{user_context}")
@@ -245,6 +258,7 @@ class RAGPipeline:
             return {
                 "answer": "I'm temporarily unavailable — the AI model is not responding. Please try again in a moment.",
                 "sources": [],
+                "_route": "rag/llm_timeout",
             }
 
         sources = []
@@ -252,4 +266,4 @@ class RAGPipeline:
             src = doc.metadata.get("source", "")
             if src and src not in sources:
                 sources.append(src)
-        return {"answer": answer, "sources": sources}
+        return {"answer": answer, "sources": sources, "_route": "rag"}

@@ -63,12 +63,29 @@ def _get_connection():
 # Answer quality classifier
 # ---------------------------------------------------------------------------
 
-def _classify(answer: str) -> str:
+def _classify(answer: str, route: str = "") -> str:
     a = (answer or "").lower()
     if "temporarily unavailable" in a or "not responding" in a:
         return "LLM_TIMEOUT"
     if "unknown column" in a or "query failed" in a or "query rejected" in a or "syntax error" in a:
         return "SQL_ERROR"
+    # Schema-dump: response is a markdown column list with no real answer.
+    # Looks like "| name | creation | modified | ..." at the start.
+    if re.match(r"\s*\|\s*name\s*\|", answer or "") and "count" not in a and "sum" not in a:
+        return "SCHEMA_DUMP"
+    # Workflow hallucination: RAG made up Draft/Submitted/Cancelled for a question
+    # that actually needs the live workflow handler. Real workflow-handler answers
+    # always include `/app/workflow/<name>` so the link check distinguishes them.
+    if "workflow" in a and "draft" in a and "submitted" in a and "cancelled" in a \
+       and "/app/workflow/" not in (answer or ""):
+        return "WORKFLOW_HALLUCINATION"
+    # Capability-menu fallback — but only flag when the router did NOT intend it.
+    # regex/greeting, regex/capabilities, llm/greeting, llm/capabilities are
+    # legitimate menu responses; everything else hitting that menu is a routing miss.
+    intentional_menu_routes = {"regex/greeting", "regex/capabilities", "llm/greeting", "llm/capabilities"}
+    if "i can help you with" in a and "roles & permissions" in a and "stock & inventory" in a \
+       and route not in intentional_menu_routes:
+        return "FALLBACK_MENU"
     if "i don't have documentation" in a or "i don't know" in a:
         return "NO_DOCS"
     if "please specify" in a or "no records found" in a or "not found" in a or "no open tasks" in a:
@@ -79,16 +96,22 @@ def _classify(answer: str) -> str:
 
 
 _STATUS_COLOUR = {
-    "OK":          "\033[92m",   # green
-    "INCOMPLETE":  "\033[93m",   # yellow
-    "NO_DOCS":     "\033[93m",   # yellow
-    "SQL_ERROR":   "\033[91m",   # red
-    "LLM_TIMEOUT": "\033[91m",   # red
-    "GEN_FAILED":  "\033[91m",   # red
+    "OK":                       "\033[92m",   # green
+    "INCOMPLETE":               "\033[93m",   # yellow
+    "NO_DOCS":                  "\033[93m",   # yellow
+    "FALLBACK_MENU":            "\033[93m",   # yellow
+    "SQL_ERROR":                "\033[91m",   # red
+    "LLM_TIMEOUT":              "\033[91m",   # red
+    "GEN_FAILED":               "\033[91m",   # red
+    "SCHEMA_DUMP":              "\033[91m",   # red
+    "WORKFLOW_HALLUCINATION":   "\033[91m",   # red
 }
 _RESET = "\033[0m"
 _BOLD  = "\033[1m"
-_FAILED_STATUSES = {"SQL_ERROR", "LLM_TIMEOUT", "NO_DOCS", "INCOMPLETE", "GEN_FAILED"}
+_FAILED_STATUSES = {
+    "SQL_ERROR", "LLM_TIMEOUT", "NO_DOCS", "INCOMPLETE", "GEN_FAILED",
+    "SCHEMA_DUMP", "WORKFLOW_HALLUCINATION", "FALLBACK_MENU",
+}
 
 
 def _coloured(text: str, status: str) -> str:
@@ -123,7 +146,8 @@ def fetch_logs(
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     sql = f"""
         SELECT name, user, question, answer, session_id,
-               current_doctype, current_doc, creation
+               current_doctype, current_doc, creation,
+               `_route`, status AS persisted_status, execution_ms
         FROM `tabAI Chat Log`
         {where}
         ORDER BY creation DESC
@@ -141,9 +165,12 @@ def fetch_logs(
 
     rows = [dict(r) for r in rows]
 
-    # Attach status classification
+    # _route, persisted_status, execution_ms now come from flat columns.
+    # _classify is post-hoc quality assessment (SCHEMA_DUMP, FALLBACK_MENU, etc.)
+    # which is finer-grained than the 4-value persisted status enum.
     for r in rows:
-        r["_status"] = _classify(r.get("answer", ""))
+        r["_route"] = r.get("_route") or ""
+        r["_status"] = _classify(r.get("answer", ""), r["_route"])
 
     if failed_only:
         rows = [r for r in rows if r["_status"] in _FAILED_STATUSES]
@@ -158,16 +185,39 @@ def fetch_logs(
 def print_stats(rows: list[dict]):
     from collections import Counter
     total = len(rows)
-    statuses = Counter(r["_status"] for r in rows)
-    users    = Counter(r.get("user") or "anonymous" for r in rows)
+    persisted    = Counter((r.get("persisted_status") or "(none)") for r in rows)
+    quality      = Counter(r["_status"] for r in rows)
+    routes       = Counter(r.get("_route") or "(unrouted)" for r in rows)
+    users        = Counter(r.get("user") or "anonymous" for r in rows)
+    timings      = [int(r.get("execution_ms") or 0) for r in rows if r.get("execution_ms")]
 
     print(f"\n{_BOLD}=== STATS ({total} rows) ==={_RESET}")
-    print(f"\n  {'Status':<15} Count   %")
-    print(f"  {'-'*30}")
-    for status, count in sorted(statuses.items(), key=lambda x: -x[1]):
+
+    print(f"\n  {'Persisted status':<25} Count   %")
+    print(f"  {'-'*40}")
+    for status, count in sorted(persisted.items(), key=lambda x: -x[1]):
         pct = count / total * 100 if total else 0
-        line = f"  {status:<15} {count:<7} {pct:.1f}%"
+        print(f"  {status:<25} {count:<7} {pct:.1f}%")
+
+    print(f"\n  {'Quality (classifier)':<25} Count   %")
+    print(f"  {'-'*40}")
+    for status, count in sorted(quality.items(), key=lambda x: -x[1]):
+        pct = count / total * 100 if total else 0
+        line = f"  {status:<25} {count:<7} {pct:.1f}%"
         print(_coloured(line, status))
+
+    print(f"\n  {'Route':<35} Count   %")
+    print(f"  {'-'*50}")
+    for route, count in sorted(routes.items(), key=lambda x: -x[1]):
+        pct = count / total * 100 if total else 0
+        print(f"  {route:<35} {count:<7} {pct:.1f}%")
+
+    if timings:
+        timings.sort()
+        avg = sum(timings) // len(timings)
+        p50 = timings[len(timings) // 2]
+        p95 = timings[max(0, int(len(timings) * 0.95) - 1)]
+        print(f"\n  {_BOLD}Execution time (ms):{_RESET}  avg={avg}  p50={p50}  p95={p95}  max={timings[-1]}")
 
     print(f"\n  {'User':<40} Count")
     print(f"  {'-'*50}")
@@ -180,7 +230,8 @@ def print_stats(rows: list[dict]):
         print(f"\n{_BOLD}  Failed / degraded questions:{_RESET}")
         for r in failed:
             q = (r.get("question") or "")[:80]
-            print(_coloured(f"  [{r['_status']}] {q}", r["_status"]))
+            route = r.get("_route") or "?"
+            print(_coloured(f"  [{r['_status']}] [{route}] {q}", r["_status"]))
     print()
 
 
@@ -204,8 +255,12 @@ def print_rows(rows: list[dict], show_answer_len: int = 200):
         doctype = r.get("current_doctype") or ""
 
         sep = "─" * 72
+        route = r.get("_route") or ""
+        ms = r.get("execution_ms")
+        ms_str = f"  {int(ms)}ms" if ms else ""
         print(f"\n{sep}")
-        print(f"{_BOLD}#{i:>3}  {ts}  {user}{_RESET}  {_coloured(status, status)}")
+        print(f"{_BOLD}#{i:>3}  {ts}  {user}{_RESET}  {_coloured(status, status)}"
+              f"{('  ['+route+']') if route else ''}{ms_str}")
         if session:
             print(f"      session: {session}")
         if doctype or doc:

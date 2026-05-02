@@ -53,10 +53,72 @@ DOCTYPE_ALIASES: dict[str, str] = {
     "SCO": "Subcontracting Order",
 }
 
+# Title-case phrase aliases — match free-text doctype mentions before falling back
+# to the regex extractor. Lower-cased keys for case-insensitive lookup.
+_PHRASE_ALIASES: dict[str, str] = {
+    "purchase order": "Purchase Order",
+    "sales order": "Sales Order",
+    "delivery note": "Delivery Note",
+    "purchase receipt": "Purchase Receipt",
+    "purchase invoice": "Purchase Invoice",
+    "sales invoice": "Sales Invoice",
+    "material request": "Material Request",
+    "stock entry": "Stock Entry",
+    "stock reconciliation": "Stock Reconciliation",
+    "journal entry": "Journal Entry",
+    "payment entry": "Payment Entry",
+    "work order": "Work Order",
+    "pick list": "Pick List",
+    "subcontracting order": "Subcontracting Order",
+    "request for quotation": "Request for Quotation",
+    "supplier quotation": "Supplier Quotation",
+    "blanket order": "Blanket Order",
+    "access request": "Access Request",
+    "warehouse": "Warehouse",
+    "item": "Item",
+    "supplier": "Supplier",
+    "customer": "Customer",
+    "user": "User",
+    "role": "Role",
+    "bom": "BOM",
+    "grn": "Purchase Receipt",
+    "po": "Purchase Order",
+    "so": "Sales Order",
+    "dn": "Delivery Note",
+}
+
 
 def resolve_doctype(token: str) -> str:
-    upper = token.strip().upper()
-    return DOCTYPE_ALIASES.get(upper, token.strip())
+    """Resolve a token (abbr/phrase/raw) to the canonical Frappe DocType name."""
+    raw = token.strip()
+    upper = raw.upper()
+    if upper in DOCTYPE_ALIASES:
+        return DOCTYPE_ALIASES[upper]
+    lower = raw.lower()
+    if lower in _PHRASE_ALIASES:
+        return _PHRASE_ALIASES[lower]
+    return raw
+
+
+def _slugify_doctype(doctype: str) -> str:
+    """ERPNext URL slug for a doctype: 'Purchase Order' → 'purchase-order'."""
+    return doctype.strip().lower().replace(" ", "-")
+
+
+def _extract_doctype_anywhere(text: str) -> str | None:
+    """
+    Best-effort doctype extraction from free text.
+    Tries phrase aliases first (handles 'workflow of Purchase Order'), then abbrs.
+    """
+    lower = text.lower()
+    # Sort longest-first so 'purchase order' wins over 'purchase'.
+    for phrase in sorted(_PHRASE_ALIASES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(phrase)}\b", lower):
+            return _PHRASE_ALIASES[phrase]
+    for abbr, canonical in DOCTYPE_ALIASES.items():
+        if re.search(rf"\b{re.escape(abbr)}\b", text):
+            return canonical
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -82,12 +144,10 @@ _DOCTYPE_ROLES_RE = re.compile(
 _USER_ROLES_RE = re.compile(
     r"(my\s+roles?"
     r"|what\s+roles?\s+(do\s+i|i\s+have|does\s+\S+\s+have)"
-    r"|list\s+(all\s+)?roles?"
-    r"|roles?\s+(i|for\s+user|assigned\s+to)"
-    r"|what\s+all\s+roles?"
-    r"|\bgive\s+(me\s+)?list\s+of\s+roles?"
-    r"|\broles?\s+(for|of)\s+user\b"
-    r"|\buser\b.{1,40}\broles?\b)",
+    r"|roles?\s+(i\s+have|for\s+user|assigned\s+to\s+(me|user))"
+    r"|what\s+all\s+roles?\s+(do\s+i|i\s+have)"
+    r"|\bgive\s+(me\s+)?list\s+of\s+my\s+roles?"
+    r"|\broles?\s+(for|of)\s+user\s+\S+@)",
     re.I,
 )
 _ACCESS_CHECK_RE = re.compile(
@@ -130,6 +190,38 @@ _IDENTITY_RE = re.compile(
     re.I,
 )
 
+# Bare greetings without "athena" — should introduce itself
+_GREETING_RE = re.compile(
+    r"^\s*(hi|hello|hey|good\s+(morning|afternoon|evening)|howdy|sup)\s*[!.\?]?\s*$",
+    re.I,
+)
+
+# "what can you do", "what else can you help me with", "help me", etc.
+_CAPABILITIES_RE = re.compile(
+    r"(what\s+(can|else)\s+(you|athena)\s+(do|help)"
+    r"|what\s+all\s+(can\s+you|you\s+can)"
+    r"|how\s+can\s+you\s+help"
+    r"|your\s+capabilities"
+    r"|what\s+are\s+your\s+(features|capabilities|functions)"
+    r"|help\s+me\s+with\s+(this|erp|erpnext))",
+    re.I,
+)
+
+# "what is my username", "my email", "who am i"
+_USERNAME_RE = re.compile(
+    r"(what\s+is\s+my\s+(username|email|user\s*name|user\s*id)"
+    r"|who\s+am\s+i"
+    r"|\bmy\s+(username|email|user\s*name|user\s*id)\b)",
+    re.I,
+)
+
+# "is user X enabled/active/disabled"
+_USER_STATUS_RE = re.compile(
+    r"\b(is\s+user\s+\S+\s+(enabled|active|disabled|blocked)"
+    r"|user\s+\S+\s+(status|enabled|active|disabled))\b",
+    re.I,
+)
+
 # Document detail lookup: "show me SO-2024-00123", "details of PO-2024-001"
 _DOC_LOOKUP_RE = re.compile(
     r"(show\s+(me\s+)?|details?\s+(of\s+|for\s+)?|open\s+|fetch\s+|get\s+|what\s+is\s+)"
@@ -147,6 +239,80 @@ _PENDING_APPROVALS_RE = re.compile(
     r"|approval\s+queue"
     r"|waiting\s+for\s+my\s+approval"
     r"|\bmy\s+approvals?\b)",
+    re.I,
+)
+
+# Workflow questions: "workflow of PO", "states for Purchase Order", "approval flow for GRN"
+_WORKFLOW_RE = re.compile(
+    r"(\bworkflow\b|\bworkflow\s+state\b|\bworkflow\s+stages?\b"
+    r"|\bapproval\s+(flow|process|chain|stages?|states?)\b"
+    r"|\b(states|stages|transitions)\s+(of|for|in)\s+\S"
+    r"|\blist\s+(of\s+)?(all\s+)?workflows?\b"
+    r"|\bwhat\s+workflows?\s+exist\b"
+    r"|\bwho\s+can\s+approve\b)",
+    re.I,
+)
+
+# "How to / give me a link / take me there" — must fire BEFORE NL→SQL
+# so phrases like "how to do data import" don't get translated to SQL.
+_HOWTO_RE = re.compile(
+    r"(\bhow\s+(to|do|can)\s+(i|we|you)?\s*\w"
+    r"|\bhow\s+to\s+\w"
+    r"|\bsteps?\s+to\s+\w"
+    r"|\bwhere\s+(do\s+i|can\s+i|to)\b"
+    r"|\b(give\s+me|share|provide)\s+(the\s+|a\s+)?(link|url|page|path)"
+    r"|\btake\s+me\s+(to|there)\b"
+    r"|\bnavigate\s+to\b"
+    r"|\b(go|move)\s+to\s+\w"
+    r"|\bopen\s+(the\s+)?(page|form|new)\b"
+    r"|\b(redirect|guide)\s+me\b"
+    r"|\blink\s+(to|for|of)\b"
+    # "I want to / I need to / let me + action-verb": action verbs are constrained
+    # so this doesn't swallow questions like "I want to know workflow of PO"
+    r"|\b(want|need)\s+to\s+(import|export|create|make|raise|add|setup|configure|reconcile|transfer|move|generate|file)\b"
+    r"|\bprocess\s+(to|of|for)\s+(import|export|create|make|raise|add|setup|configure|reconcile|transfer|move|generate|file|return|pay)\b"
+    r"|\blet\s+me\s+(import|export|create|make|raise|add)\b"
+    # Bare references to known how-to subjects — the howto map will resolve them
+    r"|\bdata\s+import\b"
+    r"|\bstock\s+reconciliation\b"
+    r"|\bmaterial\s+(transfer|issue|receipt)\b)",
+    re.I,
+)
+
+# Write-action requests we should refuse-with-deep-link (read-only bot)
+_WRITE_ACTION_RE = re.compile(
+    r"\b(create|make|add|new|register|raise|generate|file|submit|update|edit|modify|delete|cancel|amend|approve|reject)\b",
+    re.I,
+)
+
+# "List all <something>" — small set with hand-written queries (no LLM SQL)
+_LIST_USERS_RE     = re.compile(r"\b(list|show|give\s+me)\s+(of\s+|me\s+)?(all\s+)?(active\s+)?users?\b", re.I)
+_LIST_WAREHOUSES_RE = re.compile(r"\b(list|show|give\s+me)\s+(of\s+|me\s+)?(all\s+)?warehouses?\b", re.I)
+_LIST_ROLES_RE     = re.compile(r"\b(list|show|give\s+me)\s+(of\s+|me\s+)?(all\s+)?roles?\b", re.I)
+
+# Saved-report routes: must beat NL→SQL so "show sales register report" doesn't get translated
+_REPORT_LIST_RE = re.compile(
+    r"(\b(list|show|give\s+me)\s+(of\s+|me\s+)?(all\s+)?(saved\s+|available\s+)?reports?\b"
+    r"|\bwhat\s+reports?\s+(are\s+)?(available|exist)\b"
+    r"|\bavailable\s+reports?\b"
+    r"|\breports?\s+(for|on)\s+\w)",
+    re.I,
+)
+_REPORT_RUN_RE = re.compile(
+    r"(\b(run|execute|generate|fetch|open)\s+(the\s+)?[\w\- ]+?\s+report\b"
+    r"|\breport\s*[-–:]\s*\S"
+    r"|\b(show|give\s+me)\s+(the\s+)?[\w\- ]+?\s+report\b)",
+    re.I,
+)
+
+# Schema reflection: "what fields does Delivery Note have", "columns of Sales Order"
+_DOCTYPE_INFO_RE = re.compile(
+    r"(\b(what|which)\s+fields?\s+(does|are\s+in|of)\b"
+    r"|\bfields?\s+(of|in|for)\s+(doctype\s+)?\S"
+    r"|\bcolumns?\s+(of|in|for)\s+(doctype\s+)?\S"
+    r"|\bschema\s+(of|for)\s+(doctype\s+)?\S"
+    r"|\bstructure\s+of\s+(doctype\s+)?\S"
+    r"|\bdescribe\s+(doctype\s+)?\S)",
     re.I,
 )
 
@@ -173,6 +339,71 @@ _DB_QUERY_ROLES = {
     "Purchase Manager", "Sales Manager",
 }
 
+# Detect SQL that would dump an entire table without aggregating or filtering.
+# Matches `SELECT * FROM tabX [LIMIT N]` (with optional ORDER BY).
+_SCHEMA_DUMP_RE = re.compile(
+    r"""
+    ^\s*SELECT\s+\*\s+FROM\s+`?[\w\s]+`?
+    (?:\s+ORDER\s+BY\s+\S+(?:\s+(?:ASC|DESC))?)?
+    (?:\s+LIMIT\s+\d+)?\s*;?\s*$
+    """,
+    re.I | re.X,
+)
+
+
+# SQL syntax breaks that must NOT be swallowed when greedily capturing a
+# multi-word table name. Single-word keywords listed here are unambiguous;
+# words like ORDER and GROUP are common in Frappe doctype names ("Sales Order",
+# "Item Group") so they're matched only in their multi-word clause forms.
+_SQL_STOP_RE = (
+    r"WHERE|HAVING|LIMIT|UNION|SELECT|FROM|AS|USING|AND|OR|NOT|IN|IS|NULL|BETWEEN|LIKE|ON|JOIN"
+    r"|ORDER\s+BY|GROUP\s+BY"
+    r"|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|OUTER\s+JOIN|CROSS\s+JOIN"
+)
+# Match `FROM/JOIN <Title-Case multi-word ident>` not already wrapped in backticks.
+# Uppercase-letter checks use `(?-i:[A-Z])` to stay case-sensitive even though the
+# pattern as a whole is re.I (so FROM/JOIN/keywords work both cases). Without
+# this, lowercase aliases like `a`, `po` get swallowed into the table-name capture.
+_UNQUOTED_TABLE_RE = re.compile(
+    r"\b(FROM|JOIN)\s+"
+    r"(?!`)"
+    r"(?:tab)?"
+    r"((?-i:[A-Z])\w*(?:\s+(?!(?:" + _SQL_STOP_RE + r")\b)(?-i:[A-Z])\w*)+)"
+    r"(?=\s|$|;|,)",
+    re.I,
+)
+
+
+def _backtick_unquoted_tables(sql: str) -> str:
+    """
+    LLM occasionally emits multi-word table names without backticks
+    (e.g. `FROM Asset Revaluation WHERE …`), producing a MariaDB syntax error.
+    Wrap any unquoted Title-Case multi-word identifier following FROM/JOIN
+    with backticks, prepending `tab` if the LLM also dropped that prefix.
+    """
+    def _wrap(m: re.Match) -> str:
+        # group(2) excludes any leading `tab` (consumed by the prefix in the regex),
+        # so always normalise to `tabFoo Bar` form.
+        keyword = m.group(1)
+        name = re.sub(r"\s+", " ", m.group(2).strip())
+        return f"{keyword} `tab{name}`"
+    return _UNQUOTED_TABLE_RE.sub(_wrap, sql)
+
+
+def _is_schema_dump(sql: str) -> bool:
+    """True if the SQL is `SELECT * FROM <table>` with no WHERE/aggregate — a column dump."""
+    s = sql.strip().rstrip(";")
+    if _SCHEMA_DUMP_RE.match(s):
+        return True
+    # Defense: `SELECT col1, col2, ... FROM tabX` (no WHERE, no aggregate, no GROUP BY)
+    # with > 5 columns is also schema-dump-like.
+    if re.search(r"\bWHERE\b|\bCOUNT\s*\(|\bSUM\s*\(|\bAVG\s*\(|\bMAX\s*\(|\bMIN\s*\(|\bGROUP\s+BY\b", s, re.I):
+        return False
+    cols_match = re.match(r"^\s*SELECT\s+(.+?)\s+FROM\b", s, re.I | re.S)
+    if cols_match and cols_match.group(1).count(",") >= 5:
+        return True
+    return False
+
 # SchemaRetriever is initialised in main.py lifespan and injected via route_query().
 # This avoids a circular import and keeps schema logic in one place.
 
@@ -191,7 +422,9 @@ Real table schemas (table: col1, col2, ...):
 {schema}
 
 Write a single safe SELECT query for the following question.
-- Use COUNT(*) or COUNT(`name`) for totals.
+- For "how many" / "count" questions → use COUNT(*) or COUNT(`name`).
+- For "total amount" / "sum" / "value" questions → use SUM(`grand_total`) or SUM(`rounded_total`), NOT COUNT.
+- When the user asks for "amount" or "value", always use SUM on a monetary column (grand_total, rounded_total, base_grand_total, total, net_total), not COUNT.
 - Do NOT use INSERT, UPDATE, DELETE, DROP, or any DML/DDL.
 - Do NOT include a LIMIT clause (one will be added automatically).
 - Return ONLY the raw SQL statement, no explanation, no markdown fences.
@@ -218,6 +451,10 @@ Intents:
 - db_query: asking for a live count, total, or data query against the ERP database. params: {{}}
 - pending_approvals: asking what documents are pending the user's approval or action. params: {{}}
 - doc_lookup: asking to show or fetch details of a specific document by its name (e.g. SO-2024-00123). params: {{"docname": "..."}}
+- user_status: asking if a user is enabled/active/disabled. params: {{"username": "partial email or name"}}
+- my_username: asking what their own username/email is. params: {{}}
+- greeting: saying hi, hello, hey. params: {{}}
+- capabilities: asking what the chatbot can do or help with. params: {{}}
 - rag: general ERP documentation or process question not covered above. params: {{}}
 
 Recent conversation history (may be empty):
@@ -251,13 +488,32 @@ def _llm_classify(question: str, history: str = "") -> dict | None:
 # Router
 # ---------------------------------------------------------------------------
 
-def route_query(question: str, username: str, history: str = "", schema_retriever=None) -> dict | None:
+def route_query(question: str, username: str, history: str = "", schema_retriever=None,
+                user_roles: list[str] | None = None, _skip_compound: bool = False) -> dict | None:
     """
     Returns a result dict if a DB tool handles it, else None (fall through to RAG).
-    schema_retriever: optional SchemaRetriever instance for NL-to-SQL schema injection.
+    The result dict includes a `_route` key naming the path taken — main.py stamps
+    this into tabAI Chat Log.request_payload for post-hoc analysis.
+
+    `user_roles` is the curated role list from the frontend (preferred over a DB
+    fetch, because Administrator legitimately has every role and would otherwise
+    drown the workflow handler's "your roles" line).
+    `_skip_compound` is set True when the compound splitter recurses into a sub-question,
+    so we don't ping-pong forever if a sub-question also looks compound.
     """
     try:
         import db
+
+        # --- Athena Skill pre-step: admin-curated workflow content beats every regex.
+        # If admins want to override identity/greeting too, that's a feature — they
+        # publish a skill with a matching intent_pattern.
+        skill = db.find_athena_skill_match(question)
+        if skill:
+            return {
+                "answer": skill.get("content_md") or "",
+                "sources": [],
+                "_route": f"skill/{skill.get('skill_id', 'unknown')}",
+            }
 
         # --- Regex pass (fast) ---
         if _IDENTITY_RE.search(question):
@@ -267,45 +523,150 @@ def route_query(question: str, username: str, history: str = "", schema_retrieve
                     "I can help you with Frappe/ERPNext roles, permissions, stock, and process questions."
                 ),
                 "sources": [],
+                "_route": "regex/identity",
             }
+
+        if _GREETING_RE.search(question):
+            return {
+                "answer": (
+                    "Hi! I am **Athena**, your ERP support assistant. I can help you with:\n"
+                    "- **Roles & Permissions** — your roles, role permissions, doctype access\n"
+                    "- **Stock & Inventory** — item stock balance across warehouses\n"
+                    "- **Document Lookup** — fetch details of any SO, PO, DN, GRN, etc.\n"
+                    "- **Pending Approvals** — documents waiting for your action\n"
+                    "- **Workflows** — states, transitions, who can approve\n"
+                    "- **How-to & links** — direct deep-links to ERP pages with steps\n"
+                    "- **Database Queries** — count, total, or list records from ERP\n\n"
+                    "How can I help you today?"
+                ),
+                "sources": [],
+                "_route": "regex/greeting",
+            }
+
+        if _CAPABILITIES_RE.search(question):
+            return {
+                "answer": (
+                    "Here's what I can help you with:\n\n"
+                    "1. **Roles & Permissions** — \"What roles do I have?\", \"Who can access Sales Order?\"\n"
+                    "2. **Stock Balance** — \"Stock of SLR-100W\", \"CCOP-0001-AADITYA POLYMAKE stock\"\n"
+                    "3. **Document Lookup** — \"Show me PO-2024-00123\", \"Details of GRN-2026-03990\"\n"
+                    "4. **Pending Approvals** — \"What's pending my approval?\"\n"
+                    "5. **Workflows** — \"Workflow of Purchase Order\", \"Who can approve GRN?\"\n"
+                    "6. **How-to / Links** — \"How to do data import?\", \"Take me to create a new item\"\n"
+                    "7. **Database Queries** — \"How many submitted DNs?\", \"Total amount of Purchase Receipts\"\n"
+                    "8. **Open Tasks** — \"My open tasks\"\n\n"
+                    "Just ask your question naturally!"
+                ),
+                "sources": [],
+                "_route": "regex/capabilities",
+            }
+
+        if _USERNAME_RE.search(question):
+            return {
+                "answer": f"Your username is **{username}**.",
+                "sources": [],
+                "_route": "regex/username",
+            }
+
+        if _USER_STATUS_RE.search(question):
+            r = _handle_user_status(question, db); r["_route"] = "regex/user_status"; return r
 
         # If question refers back to a role ("that role", "it") and history has one,
         # treat as role_perms rather than doctype_roles even if doctype_roles regex fires.
         _refers_to_role = _REFERS_BACK_RE.search(question) and _extract_role_name(question, history)
 
         if _USERS_WITH_ROLE_RE.search(question):
-            return _handle_users_with_role(question, db)
+            r = _handle_users_with_role(question, db); r["_route"] = "regex/users_with_role"; return r
+
+        # --- Compound / multi-part question splitter ---
+        # "what is workflow of GRN, and can I make B2B grn?" → run each clause.
+        # Only triggers when the question has a clear conjunction AND each part is non-trivial.
+        if not _skip_compound and _looks_compound(question):
+            parts = _split_compound(question)
+            if len(parts) >= 2:
+                return _handle_compound(parts, username, history, db, schema_retriever, user_roles)
+
+        if _WORKFLOW_RE.search(question):
+            r = _handle_workflow(question, username, db, history, user_roles=user_roles)
+            if r:
+                r["_route"] = "regex/workflow"
+                return r
+
+        # How-to / link intents must beat NL→SQL — phrases like "how to do data import"
+        # otherwise get picked up by _NL_QUERY_RE and the LLM dumps the table schema.
+        if _HOWTO_RE.search(question) or (
+            _WRITE_ACTION_RE.search(question) and _extract_doctype_anywhere(question)
+        ):
+            r = _handle_howto(question, username, db)
+            if r:
+                r["_route"] = "regex/howto"
+                return r
+
+        # Saved-report routes (must beat list_users / NL→SQL — "show me reports" else
+        # would hit list_users via the loose 'show me' prefix).
+        if _REPORT_LIST_RE.search(question):
+            r = _handle_report_list(question, db)
+            if r:
+                r["_route"] = "regex/report_list"
+                return r
+        if _REPORT_RUN_RE.search(question):
+            r = _handle_report_run(question, username, db)
+            if r:
+                r["_route"] = "regex/report_run"
+                return r
+
+        # Hand-written list queries — bypass LLM SQL generation
+        if _LIST_USERS_RE.search(question):
+            r = _handle_list_users(db); r["_route"] = "regex/list_users"; return r
+        if _LIST_WAREHOUSES_RE.search(question):
+            r = _handle_list_warehouses(db); r["_route"] = "regex/list_warehouses"; return r
+        if _LIST_ROLES_RE.search(question):
+            r = _handle_list_roles(db); r["_route"] = "regex/list_roles"; return r
 
         if _DOCTYPE_ROLES_RE.search(question) and not _refers_to_role:
             result = _handle_doctype_roles(question, db, history)
             if result:
+                result["_route"] = "regex/doctype_roles"
                 return result
 
         if _ROLE_PERMS_RE.search(question) or _refers_to_role:
-            return _handle_role_permissions(question, db, history)
+            r = _handle_role_permissions(question, db, history); r["_route"] = "regex/role_perms"; return r
 
         if _USER_ROLES_RE.search(question):
-            return _handle_user_roles(question, username, db, history)
+            r = _handle_user_roles(question, username, db, history); r["_route"] = "regex/user_roles"; return r
 
         if _ACCESS_CHECK_RE.search(question):
-            return _handle_access_check(question, username, db)
+            r = _handle_access_check(question, username, db)
+            if r:
+                r["_route"] = "regex/access_check"
+                return r
 
         if _TASK_RE.search(question):
-            return _handle_tasks(username, db)
+            r = _handle_tasks(username, db); r["_route"] = "regex/tasks"; return r
 
         if _STOCK_RE.search(question) and not _PROCESS_INTENT_RE.search(question):
-            return _handle_stock(question, db, history)
+            r = _handle_stock(question, db, history); r["_route"] = "regex/stock"; return r
 
         if _PENDING_APPROVALS_RE.search(question):
-            return _handle_pending_approvals(username, db)
+            r = _handle_pending_approvals(username, db); r["_route"] = "regex/pending_approvals"; return r
 
         if _DOC_LOOKUP_RE.search(question) or _DOCNAME_RE.search(question):
             result = _handle_document_lookup(question, db)
             if result:
+                result["_route"] = "regex/doc_lookup"
                 return result
 
+        # Doctype info: "what fields does X have" — direct schema lookup beats NL→SQL.
+        if _DOCTYPE_INFO_RE.search(question):
+            r = _handle_doctype_info(question, db)
+            if r:
+                r["_route"] = "regex/doctype_info"
+                return r
+
         if _NL_QUERY_RE.search(question):
-            return _handle_nl_query(question, username, db, schema_retriever)
+            r = _handle_nl_query(question, username, db, schema_retriever)
+            r["_route"] = "regex/nl_query"
+            return r
 
     except Exception as e:
         logger.warning(f"DB tool (regex path) failed, trying LLM classifier: {e}")
@@ -317,7 +678,10 @@ def route_query(question: str, username: str, history: str = "", schema_retrieve
 
     try:
         import db
-        return _dispatch_classified(classification, question, username, db, schema_retriever)
+        r = _dispatch_classified(classification, question, username, db, schema_retriever)
+        if r:
+            r["_route"] = f"llm/{classification.get('intent', 'unknown')}"
+        return r
     except Exception as e:
         logger.warning(f"DB tool (LLM path) failed, falling back to RAG: {e}")
 
@@ -372,6 +736,32 @@ def _dispatch_classified(classification: dict, question: str, username: str, db,
 
     if intent == "doc_lookup":
         return _handle_document_lookup(question, db)
+
+    if intent == "user_status":
+        return _handle_user_status(question, db)
+
+    if intent == "my_username":
+        return {"answer": f"Your username is **{username}**.", "sources": []}
+
+    if intent == "greeting":
+        return {
+            "answer": (
+                "Hi! I am **Athena**, your ERP support assistant. "
+                "I can help with roles, permissions, stock, document lookups, and more. "
+                "How can I help you today?"
+            ),
+            "sources": [],
+        }
+
+    if intent == "capabilities":
+        return {
+            "answer": (
+                "I can help with: roles & permissions, stock balance, document lookups, "
+                "pending approvals, database queries, users with roles, open tasks, and ERP process questions. "
+                "Just ask naturally!"
+            ),
+            "sources": [],
+        }
 
     return None
 
@@ -481,13 +871,42 @@ def _format_doctype_roles(doctype: str, rows: list) -> dict:
     return {"answer": f"Roles with access to **{doctype}** ({len(lines)} roles):\n" + "\n".join(lines), "sources": []}
 
 
+def _fmt_qty(val) -> str:
+    """Format Decimal/float: 0E-9 → 0, 3028.000000000 → 3,028"""
+    from decimal import Decimal
+    try:
+        d = Decimal(str(val))
+        if d == 0:
+            return "0"
+        # Remove trailing zeros and show with commas
+        return f"{int(d):,}" if d == int(d) else f"{float(d):,.2f}"
+    except Exception:
+        return str(val)
+
+
 def _format_stock(item_code: str, rows: list, limit: int | None = None) -> dict:
     if not rows:
         return {"answer": f"No stock records found for item **{item_code}**.", "sources": []}
+
+    # Filter out zero-qty warehouses by default (unless explicit limit requested)
+    from decimal import Decimal
+    non_zero = [r for r in rows if Decimal(str(r.get("actual_qty", 0))) != 0]
+    display_rows = non_zero if non_zero else rows  # show all if everything is zero
+
     if limit is not None:
-        rows = sorted(rows, key=lambda r: r["actual_qty"], reverse=True)[:limit]
-    lines = [f"- {r['warehouse']}: {r['actual_qty']} (reserved: {r['reserved_qty']})" for r in rows]
-    return {"answer": f"Stock balance for **{item_code}**:\n" + "\n".join(lines), "sources": []}
+        display_rows = sorted(display_rows, key=lambda r: float(r["actual_qty"]), reverse=True)[:limit]
+    else:
+        display_rows = sorted(display_rows, key=lambda r: float(r["actual_qty"]), reverse=True)
+
+    lines = [
+        f"- {r['warehouse']}: **{_fmt_qty(r['actual_qty'])}** (reserved: {_fmt_qty(r['reserved_qty'])})"
+        for r in display_rows
+    ]
+    total_qty = sum(float(r["actual_qty"]) for r in rows)
+    summary = f"\n\n**Total across all warehouses:** {_fmt_qty(total_qty)}"
+    if len(non_zero) < len(rows):
+        summary += f" ({len(rows) - len(non_zero)} zero-stock warehouses hidden)"
+    return {"answer": f"Stock balance for **{item_code}**:\n" + "\n".join(lines) + summary, "sources": []}
 
 
 # ---------------------------------------------------------------------------
@@ -564,6 +983,30 @@ def _handle_users_with_role(question: str, db) -> dict:
         return {"answer": f"No users found with role **{role}**.", "sources": []}
     lines = "\n".join(f"- {u}" for u in users)
     return {"answer": f"Users with role **{role}** ({len(users)} users):\n{lines}", "sources": []}
+
+
+def _handle_user_status(question: str, db) -> dict:
+    """Check if a user is enabled/active in the system."""
+    m = re.search(r"\buser\s+([\w.+\-]+(?:@[\w\-]+(?:\.[a-z]+)?)?)", question, re.I)
+    if not m:
+        return {"answer": "Please specify a user email, e.g. 'is user john@example.com enabled?'", "sources": []}
+    partial = m.group(1)
+    try:
+        with db.db_cursor() as cur:
+            cur.execute(
+                "SELECT name, full_name, enabled FROM `tabUser` WHERE name LIKE %s LIMIT 5",
+                (f"%{partial}%",),
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        return {"answer": f"Could not check user status: {e}", "sources": []}
+    if not rows:
+        return {"answer": f"No user found matching **{partial}**.", "sources": []}
+    lines = []
+    for r in rows:
+        status = "Enabled" if r["enabled"] else "Disabled"
+        lines.append(f"- **{r['name']}** ({r.get('full_name', '')}) — {status}")
+    return {"answer": f"User status:\n" + "\n".join(lines), "sources": []}
 
 
 def _handle_document_lookup(question: str, db) -> dict | None:
@@ -675,7 +1118,29 @@ def _handle_nl_query(question: str, username: str, db, schema_retriever=None) ->
     # Strip markdown fences if the LLM wrapped the query
     sql = re.sub(r"^```[a-z]*\n?", "", sql, flags=re.I).rstrip("` \n")
 
+    # Repair unquoted multi-word table names — common LLM slip that produces
+    # `FROM Asset Revaluation WHERE …`. MariaDB parses up to the first space and
+    # then chokes on the second word.
+    fixed_sql = _backtick_unquoted_tables(sql)
+    if fixed_sql != sql:
+        logger.info(f"NL-query auto-backticked tables: {sql!r} -> {fixed_sql!r}")
+        sql = fixed_sql
+
     logger.info(f"NL-query generated SQL: {sql}")
+
+    # Guardrail: reject schema-dump SQL like `SELECT * FROM tabX [LIMIT N]` with
+    # no aggregate / WHERE — this is what produced the column dump for
+    # "how to do data import" before _HOWTO_RE intercepted it. Defense in depth.
+    if _is_schema_dump(sql):
+        logger.info(f"Rejecting schema-dump SQL: {sql}")
+        return {
+            "answer": (
+                "I think you wanted documentation rather than a raw table dump. "
+                "Try asking *\"how to ...\"* or *\"give me link to ...\"* and I'll "
+                "give you the deep-link plus steps."
+            ),
+            "sources": [],
+        }
 
     # --- Execute ---
     try:
@@ -704,33 +1169,613 @@ def _handle_nl_query(question: str, username: str, db, schema_retriever=None) ->
     return {"answer": "\n".join(lines) + suffix + f"\n\n```sql\n{sql}\n```", "sources": []}
 
 
+# ---------------------------------------------------------------------------
+# M1 — Workflow handler
+# ---------------------------------------------------------------------------
+
+_DOC_STATUS_LABEL = {0: "Draft", 1: "Submitted", 2: "Cancelled"}
+
+
+def _handle_workflow(question: str, username: str, db, history: str = "",
+                     user_roles: list[str] | None = None) -> dict | None:
+    """
+    Answers questions like:
+      - "workflow of Purchase Order"
+      - "states for GRN"
+      - "who can approve PO"
+      - "list all workflows"
+    Reads from tabWorkflow / tabWorkflow Document State / tabWorkflow Transition.
+    Filters/highlights transitions by the user's current roles when known.
+    """
+    # "list all workflows" → enumerate active workflows
+    if re.search(r"\blist\s+(of\s+)?(all\s+)?workflows?\b", question, re.I) \
+       or re.search(r"\bwhat\s+workflows?\s+(exist|are\s+there)\b", question, re.I):
+        rows = db.list_active_workflows()
+        if not rows:
+            return {"answer": "No active workflows configured.", "sources": []}
+        lines = [
+            f"- **{r['document_type']}** — workflow: `{r['name']}` "
+            f"([open](/app/workflow/{r['name']}))"
+            for r in rows
+        ]
+        return {
+            "answer": f"Active workflows ({len(rows)}):\n" + "\n".join(lines),
+            "sources": [],
+        }
+
+    doctype = _extract_doctype_anywhere(question) or _extract_doctype_anywhere(history or "")
+    if not doctype:
+        return {
+            "answer": (
+                "Which doctype's workflow do you want to see? Try "
+                "*\"workflow of Purchase Order\"* or *\"who can approve GRN\"*."
+            ),
+            "sources": [],
+        }
+
+    wf = db.get_active_workflow_for_doctype(doctype)
+    if not wf:
+        return {
+            "answer": (
+                f"No active workflow is configured for **{doctype}**. "
+                f"Documents follow the standard docstatus flow (Draft → Submitted → Cancelled)."
+            ),
+            "sources": [],
+        }
+
+    states = db.get_workflow_states(wf["name"])
+    transitions = db.get_workflow_transitions(wf["name"])
+
+    # User's roles (for "who can approve" + scoping the answer).
+    # Prefer the curated list from the request (frontend already filtered out
+    # internal/system-level roles); only hit the DB as fallback.
+    if user_roles:
+        roles_set = set(user_roles)
+    else:
+        try:
+            roles_set = set(db.get_user_roles(username)) if username and username != "anonymous" else set()
+        except Exception:
+            roles_set = set()
+
+    # "Who can approve" — list distinct roles allowed on transitions whose action is approve-like
+    if re.search(r"\bwho\s+can\s+approve\b", question, re.I):
+        approve_roles = sorted({
+            t["allowed"] for t in transitions
+            if t.get("allowed") and re.search(r"\bapprov", (t.get("action") or ""), re.I)
+        })
+        if not approve_roles:
+            approve_roles = sorted({t["allowed"] for t in transitions if t.get("allowed")})
+        lines = "\n".join(f"- **{r}**" for r in approve_roles)
+        return {
+            "answer": (
+                f"Roles allowed to approve **{doctype}** "
+                f"(workflow `{wf['name']}`):\n{lines}"
+            ),
+            "sources": [],
+        }
+
+    # Full workflow rendering — states + transitions, with user-scoped highlights.
+    # doc_status comes back from MariaDB as a string ('0','1','2'); cast before lookup.
+    state_lines = []
+    for s in states:
+        try:
+            ds_key = int(s.get("doc_status") or 0)
+        except (TypeError, ValueError):
+            ds_key = -1
+        ds = _DOC_STATUS_LABEL.get(ds_key, "?")
+        edit_role = s.get("allow_edit") or "—"
+        marker = " ← your role" if edit_role in roles_set else ""
+        state_lines.append(f"- **{s['state']}** [{ds}] · editable by: `{edit_role}`{marker}")
+
+    your_transitions = []
+    other_transitions = []
+    for t in transitions:
+        cond = (t.get("condition") or "").strip()
+        cond_str = f" · _if_ `{cond}`" if cond else ""
+        line = (
+            f"- **{t['state']}** → _{t['action']}_ → **{t['next_state']}** "
+            f"· role: `{t.get('allowed') or '—'}`{cond_str}"
+        )
+        if t.get("allowed") in roles_set:
+            your_transitions.append(line)
+        else:
+            other_transitions.append(line)
+
+    sections = [f"**Workflow for {doctype}** (`{wf['name']}`)\n"]
+    sections.append("**States:**\n" + "\n".join(state_lines))
+
+    if roles_set:
+        # Only the roles that actually appear on this workflow are interesting to mention.
+        relevant_roles = sorted({
+            r for r in roles_set
+            if any(t.get("allowed") == r for t in transitions)
+            or any(s.get("allow_edit") == r for s in states)
+        })
+        roles_label = ", ".join(relevant_roles) if relevant_roles else "(none on this workflow)"
+        if your_transitions:
+            sections.append(
+                f"**Transitions you can perform** (your relevant roles: {roles_label}):\n"
+                + "\n".join(your_transitions)
+            )
+        else:
+            sections.append(
+                f"**Transitions you can perform:** none — none of your roles "
+                f"({roles_label}) are on any transition for this workflow."
+            )
+        if other_transitions:
+            sections.append("**Other transitions:**\n" + "\n".join(other_transitions))
+    else:
+        sections.append("**Transitions:**\n" + "\n".join(your_transitions + other_transitions))
+
+    sections.append(f"[Open workflow definition](/app/workflow/{wf['name']})")
+    return {"answer": "\n\n".join(sections), "sources": []}
+
+
+# ---------------------------------------------------------------------------
+# Compound question splitter — handles "X, and Y?" style multi-part asks
+# ---------------------------------------------------------------------------
+
+_COMPOUND_SPLIT_RE = re.compile(r"\s*(?:,\s*(?:and|also|then)\b|\band\s+(?:can|is|do|how|what|who|where)\s+)", re.I)
+_TRIVIAL_PART_RE = re.compile(r"^\s*(also|too|please|and|then)?\s*$", re.I)
+
+
+def _looks_compound(question: str) -> bool:
+    # Splits on ", and|also|then" with substantial tail, or "and {can|is|do|how|...}".
+    # Mid-question `?` used to be a trigger but caused false splits like
+    # "what permissions does X have? on BOM" -> ["...have", "on BOM"] which lost
+    # the doctype filter. Punctuation alone is too weak a signal.
+    if re.search(r",\s*(and|also|then)\b", question, re.I):
+        tail = re.split(r",\s*(?:and|also|then)\b", question, maxsplit=1, flags=re.I)
+        if len(tail) > 1 and len(tail[1].split()) >= 3:
+            return True
+    if re.search(r"\band\s+(?:can|is|do|how|what|who|where)\s+", question, re.I):
+        return True
+    return False
+
+
+def _split_compound(question: str) -> list[str]:
+    parts = [p.strip(" ?.,") for p in _COMPOUND_SPLIT_RE.split(question) if p and not _TRIVIAL_PART_RE.match(p)]
+    # De-dupe while preserving order, cap to 3 sub-questions
+    seen, out = set(), []
+    for p in parts:
+        if p and p.lower() not in seen and len(p.split()) >= 2:
+            seen.add(p.lower())
+            out.append(p)
+        if len(out) == 3:
+            break
+    return out
+
+
+def _handle_compound(parts: list[str], username: str, history: str, db, schema_retriever,
+                     user_roles: list[str] | None = None) -> dict:
+    answers = []
+    routes = []
+    for i, part in enumerate(parts, 1):
+        sub = route_query(part, username, history=history,
+                          schema_retriever=schema_retriever,
+                          user_roles=user_roles, _skip_compound=True)
+        if sub is None:
+            answers.append(f"**Q{i}: {part}** — I don't have a structured answer for this; check the docs.")
+            routes.append("rag")
+        else:
+            answers.append(f"**Q{i}: {part}**\n{sub.get('answer', '')}")
+            routes.append(sub.get("_route", "?"))
+    return {
+        "answer": "\n\n---\n\n".join(answers),
+        "sources": [],
+        "_route": "regex/compound[" + "+".join(routes) + "]",
+    }
+
+
+# ---------------------------------------------------------------------------
+# M2 — How-to / deep-link handler
+# ---------------------------------------------------------------------------
+
+# Maps a normalised intent phrase → (link template, ordered steps).
+# Link templates may contain {doctype_slug} or {item_code} placeholders.
+_HOWTO_INTENTS: list[tuple[re.Pattern, str, str, list[str]]] = [
+    (
+        re.compile(r"\b(data\s+import|import\s+data|import\s+items?|import\s+records?|bulk\s+import|csv\s+import)\b", re.I),
+        "Data Import",
+        "/app/data-import/new?reference_doctype={target_doctype}",
+        [
+            "Pick the target DocType (e.g. Item, Customer, Supplier).",
+            "Click **Download Template** to get the CSV with required columns.",
+            "Fill in the rows, upload via **Import File**, then click **Start Import**.",
+        ],
+    ),
+    (
+        re.compile(r"\bstock\s+reconciliation\b|\breconcile\s+stock\b", re.I),
+        "Stock Reconciliation",
+        "/app/stock-reconciliation/new",
+        [
+            "Pick the warehouse and the date for the reconciliation.",
+            "Add items with their counted quantity and valuation rate.",
+            "Save → Submit. The system creates the corrective Stock Ledger entries.",
+        ],
+    ),
+    (
+        re.compile(r"\bstock\s+entry\b|\bmaterial\s+(transfer|issue|receipt)\b|\btransfer\s+(stock|material|item)\b", re.I),
+        "Stock Entry",
+        "/app/stock-entry/new",
+        [
+            "Choose **Stock Entry Type** (Material Transfer, Material Issue, Material Receipt, etc.).",
+            "Set source / target warehouses and add items with quantities.",
+            "Save → Submit to post the stock movement.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|add|make|raise)\b[^?\n]{0,30}\bitem\b|\bitem\s+master\b", re.I),
+        "Item",
+        "/app/item/new?item_code={item_code}",
+        [
+            "Set Item Code and Item Group (mandatory).",
+            "Pick the default UOM (Unit of Measure).",
+            "Save. To stock-track it, ensure **Maintain Stock** is checked.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|add|make|register)\b[^?\n]{0,30}\b(supplier|vendor)\b", re.I),
+        "Supplier",
+        "/app/supplier/new",
+        [
+            "Set Supplier Name and Supplier Group.",
+            "Pick the default Currency and Country.",
+            "Save. Add Tax IDs / Address from the linked tabs.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|add|make|register)\b[^?\n]{0,30}\bcustomer\b", re.I),
+        "Customer",
+        "/app/customer/new",
+        [
+            "Set Customer Name and Customer Group.",
+            "Pick the Territory and default Currency.",
+            "Save. Add Address and Contact via the linked tabs.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|raise|make)\b[^?\n]{0,30}\b(purchase\s+order|po)\b", re.I),
+        "Purchase Order",
+        "/app/purchase-order/new",
+        [
+            "Pick the Supplier and required-by Date.",
+            "Add items with qty + rate (or pull from Material Request / Supplier Quotation).",
+            "Save → Submit. The PO will then enter the configured workflow.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|raise|make)\b[^?\n]{0,30}\b(sales\s+order|so)\b", re.I),
+        "Sales Order",
+        "/app/sales-order/new",
+        [
+            "Pick the Customer and Delivery Date.",
+            "Add items with qty + rate.",
+            "Save → Submit.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|make|raise)\b[^?\n]{0,30}\b(grn|purchase\s+receipt)\b", re.I),
+        "Purchase Receipt",
+        "/app/purchase-receipt/new",
+        [
+            "Pull from the source Purchase Order via **Get Items From → Purchase Order**.",
+            "Set the receiving warehouse and confirm received quantities.",
+            "Save → Submit. Stock is posted to the warehouse on submit.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|make|raise)\b[^?\n]{0,30}\b(delivery\s+note|dn)\b", re.I),
+        "Delivery Note",
+        "/app/delivery-note/new",
+        [
+            "Pull from the source Sales Order via **Get Items From → Sales Order**.",
+            "Set the source warehouse and confirm dispatched quantities.",
+            "Save → Submit.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|add|make)\b[^?\n]{0,30}\bwarehouse\b", re.I),
+        "Warehouse",
+        "/app/warehouse/new",
+        [
+            "Set Warehouse Name and Company.",
+            "Pick the Parent Warehouse (group warehouse).",
+            "Save. Mark **Is Group** if this will hold child warehouses.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|add|register)\b[^?\n]{0,30}\buser\b", re.I),
+        "User",
+        "/app/user/new",
+        [
+            "Set Email (this becomes the username) and First Name.",
+            "Assign Roles via the **Roles** tab (e.g. Stock User, Purchase User).",
+            "Save. The user receives a welcome email with a password setup link.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|setup|configure|add|make)\b[^?\n]{0,30}\bworkflow\b", re.I),
+        "Workflow",
+        "/app/workflow/new",
+        [
+            "Set Document Type and the Workflow State Field (usually `workflow_state`).",
+            "Add States with their docstatus and the role that can edit each state.",
+            "Add Transitions: from-state → action → to-state, with the role allowed.",
+            "Mark **Is Active** and Save.",
+        ],
+    ),
+    (
+        re.compile(r"\b(create|new|add|make)\b[^?\n]{0,30}\brole\b", re.I),
+        "Role",
+        "/app/role/new",
+        [
+            "Set the Role Name (e.g. *Warehouse Approver*).",
+            "Save, then go to **Role Permissions Manager** to grant DocType access.",
+        ],
+    ),
+]
+
+
+def _handle_howto(question: str, username: str, db) -> dict | None:
+    """Match a how-to / link request against _HOWTO_INTENTS and return link + steps."""
+    # Extract a possible item code (e.g. "create item ABC-001")
+    item_match = re.search(r"\b([A-Z][A-Z0-9]{1,3}-[A-Z0-9\-]{2,})\b", question)
+    item_code = item_match.group(1) if item_match else ""
+
+    # The "target_doctype" for "how to do data import for item" is the trailing doctype
+    target_doctype = _extract_doctype_anywhere(question) or "Item"
+    target_doctype_slug = _slugify_doctype(target_doctype)
+
+    for pattern, label, link_tpl, steps in _HOWTO_INTENTS:
+        if pattern.search(question):
+            link = link_tpl.format(
+                target_doctype=target_doctype,
+                doctype_slug=target_doctype_slug,
+                item_code=item_code,
+            )
+            # Strip empty query params (e.g. ?item_code= when we didn't extract one)
+            link = re.sub(r"[?&]\w+=(?=&|$)", "", link).rstrip("?&")
+            steps_md = "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
+            return {
+                "answer": (
+                    f"**{label}**\n\n"
+                    f"Open it directly: [`{link}`]({link})\n\n"
+                    f"Steps:\n{steps_md}\n\n"
+                    f"_Note: I am read-only — I cannot create the record for you, "
+                    f"but the link above takes you straight to the form._"
+                ),
+                "sources": [],
+            }
+
+    # Generic fallback: question mentions a known doctype and a write verb
+    # → build a /app/<slug>/new link.
+    if _WRITE_ACTION_RE.search(question):
+        dt = _extract_doctype_anywhere(question)
+        if dt:
+            slug = _slugify_doctype(dt)
+            link = f"/app/{slug}/new"
+            return {
+                "answer": (
+                    f"To create a new **{dt}**, open: [`{link}`]({link})\n\n"
+                    f"I am read-only and can't create it for you — "
+                    f"please fill the form and Save/Submit."
+                ),
+                "sources": [],
+            }
+
+    # Last-resort: the user clearly asked a how-to / link question (matched _HOWTO_RE
+    # in the router) but we couldn't pin down the intent. Hand back a brief menu
+    # of the most-asked links rather than dropping through to the LLM-classifier
+    # greeting fallback.
+    return {
+        "answer": (
+            "I'm not sure which page you want — could you be more specific? "
+            "Common destinations:\n"
+            "- [Data Import](/app/data-import/new) — bulk-load Items, Customers, Suppliers, etc.\n"
+            "- [New Item](/app/item/new) · [New Supplier](/app/supplier/new) · [New Customer](/app/customer/new)\n"
+            "- [New Purchase Order](/app/purchase-order/new) · [New Sales Order](/app/sales-order/new)\n"
+            "- [New Stock Entry](/app/stock-entry/new) · [Stock Reconciliation](/app/stock-reconciliation/new)\n"
+            "- [Workflows](/app/workflow) · [Users](/app/user) · [Warehouses](/app/warehouse)"
+        ),
+        "sources": [],
+    }
+
+
+# ---------------------------------------------------------------------------
+# M3 — Hand-written list handlers (bypass LLM SQL)
+# ---------------------------------------------------------------------------
+
+def _handle_list_users(db) -> dict:
+    rows = db.list_users(enabled_only=True, limit=200)
+    if not rows:
+        return {"answer": "No active users found.", "sources": []}
+    lines = [f"- **{r['name']}** — {r.get('full_name', '')}" for r in rows[:100]]
+    suffix = f"\n\n_Showing first 100 of {len(rows)} active users._" if len(rows) > 100 else f"\n\n_{len(rows)} active users._"
+    return {"answer": "Active users:\n" + "\n".join(lines) + suffix, "sources": []}
+
+
+def _handle_list_warehouses(db) -> dict:
+    rows = db.list_warehouses(limit=200)
+    if not rows:
+        return {"answer": "No warehouses found.", "sources": []}
+    lines = [
+        f"- **{r['name']}** — {r.get('warehouse_type') or '—'} · {r.get('company') or '—'}"
+        for r in rows
+    ]
+    return {"answer": f"Warehouses ({len(rows)}):\n" + "\n".join(lines), "sources": []}
+
+
+def _handle_list_roles(db) -> dict:
+    rows = db.list_roles(limit=200)
+    if not rows:
+        return {"answer": "No roles found.", "sources": []}
+    lines = [f"- {r['name']}" for r in rows]
+    return {"answer": f"Roles ({len(rows)}):\n" + "\n".join(lines), "sources": []}
+
+
+# ---------------------------------------------------------------------------
+# Saved-report handlers
+# ---------------------------------------------------------------------------
+
+_REPORT_NAME_RE = re.compile(
+    r"(?:run|execute|generate|fetch|show|give\s+me|open)\s+(?:the\s+|me\s+)?"
+    r"(?:report\s*[-–:]\s*)?"
+    r"([A-Za-z][A-Za-z0-9 \-]+?)\s+report\b",
+    re.I,
+)
+_REPORT_NAME_DASH_RE = re.compile(r"\breport\s*[-–:]\s*([A-Za-z][A-Za-z0-9 \-]+?)(?:\?|$)", re.I)
+# Frappe Query Reports embed Jinja-style filter placeholders that PyMySQL cannot bind.
+_REPORT_PLACEHOLDER_RE = re.compile(r"%\([\w\s]+\)s|\{\{|\{%")
+
+
+def _handle_report_list(question: str, db) -> dict | None:
+    filter_doctype = _extract_doctype_anywhere(question)
+    rows = db.list_saved_reports(filter_doctype=filter_doctype, limit=100)
+    scope = f" for **{filter_doctype}**" if filter_doctype else ""
+    if not rows:
+        return {
+            "answer": (
+                f"No runnable reports found{scope}. Athena can only execute Query Reports — "
+                "Script and Report Builder reports must be run from the ERPNext desk."
+            ),
+            "sources": [],
+        }
+    lines = [f"- **{r['name']}** — {r.get('ref_doctype') or '—'}" for r in rows]
+    return {
+        "answer": f"Query Reports{scope} ({len(rows)}):\n" + "\n".join(lines),
+        "sources": [],
+    }
+
+
+def _handle_report_run(question: str, username: str, db) -> dict | None:
+    m = _REPORT_NAME_RE.search(question) or _REPORT_NAME_DASH_RE.search(question)
+    if not m:
+        return None
+    name = m.group(1).strip().rstrip("?.")
+    if not name:
+        return None
+    report = db.get_query_report(name)
+    if not report:
+        return {"answer": f"Report **{name}** not found.", "sources": []}
+    if report.get("report_type") != "Query Report":
+        return {
+            "answer": (
+                f"Report **{report['name']}** is a {report.get('report_type')} — "
+                "Athena can only execute Query Reports. Open it in the ERPNext desk to run."
+            ),
+            "sources": [],
+        }
+    if not (username and username != "anonymous"):
+        return {"answer": "Sign in to run reports.", "sources": []}
+    sql = report.get("query") or ""
+    if _REPORT_PLACEHOLDER_RE.search(sql):
+        return {
+            "answer": (
+                f"Report **{report['name']}** requires filter values — please run it from "
+                "the ERPNext desk."
+            ),
+            "sources": [],
+        }
+    try:
+        rows = db.execute_safe_select(sql, limit=100)
+    except ValueError as e:
+        return {"answer": f"Cannot run report **{report['name']}**: {e}", "sources": []}
+    except Exception as e:
+        return {"answer": f"Report **{report['name']}** failed: {e}", "sources": []}
+    if not rows:
+        return {"answer": f"Report **{report['name']}** returned no rows.", "sources": []}
+    headers = list(rows[0].keys())
+    body_lines = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
+    for r in rows[:25]:
+        body_lines.append("| " + " | ".join(str(r.get(h, "")) for h in headers) + " |")
+    suffix = f"\n\n_Showing first 25 of {len(rows)} rows._" if len(rows) > 25 else ""
+    return {"answer": f"**{report['name']}** ({len(rows)} rows):\n" + "\n".join(body_lines) + suffix, "sources": []}
+
+
+# ---------------------------------------------------------------------------
+# Doctype info handler
+# ---------------------------------------------------------------------------
+
+def _handle_doctype_info(question: str, db) -> dict | None:
+    doctype = _extract_doctype_anywhere(question)
+    if not doctype:
+        return None
+    info = db.get_doctype_info(doctype)
+    if not info:
+        return {"answer": f"Doctype **{doctype}** not found.", "sources": []}
+    cols = info.get("columns") or []
+    flags = []
+    if info.get("custom"): flags.append("custom")
+    if info.get("istable"): flags.append("child table")
+    if info.get("issingle"): flags.append("single")
+    flag_str = f" _({', '.join(flags)})_" if flags else ""
+    naming = info.get("autoname") or info.get("naming_rule") or "—"
+    body = (
+        f"**{doctype}**{flag_str}\n"
+        f"- Module: {info.get('module') or '—'}\n"
+        f"- Naming: `{naming}`\n"
+        f"- Fields ({len(cols)}): "
+        + (", ".join(f"`{c}`" for c in cols) if cols else "_(none)_")
+    )
+    return {"answer": body, "sources": []}
+
+
+def _looks_like_item_code(s: str) -> bool:
+    """
+    True iff the candidate is a plausible Frappe item code: strictly uppercase
+    letters + digits + spaces + hyphens + periods, no lowercase. Without this
+    guard, patterns 1-3 (which use re.I) will happily capture English filler
+    like "what is total" because re.I makes [A-Z] match lowercase too.
+    """
+    s = s.strip()
+    return bool(s) and re.match(r"^[A-Z0-9][A-Z0-9 \-\.]*$", s) is not None
+
+
 def _handle_stock(question: str, db, history: str = "") -> dict:
     # Parse optional top-N limit
     limit_match = re.search(r"\btop\s+(\d+)\b", question, re.I)
     limit = int(limit_match.group(1)) if limit_match else None
 
-    # Try "item code XXXX YYYY ZZZZ" — greedy up to a warehouse/location delimiter or end
-    # Bug fix: previous regex stopped at first space; now captures full multi-word item codes
-    m = re.search(
-        r"\bitem\s+(?:code\s+)?([A-Z0-9][A-Z0-9 \-\.]+?)(?:\s+in\b|\s+at\b|\s+for\b|\s+warehouse|\?|$)",
-        question, re.I,
+    item_code = None
+
+    # Pattern 1: "<item code> stock/balance/qty" — item code is everything before the keyword
+    # Handles "CCOP-0001-AADITYA POLYMAKE stock"
+    m0 = re.search(
+        r"^([A-Z0-9][A-Z0-9 \-\.]+?)\s+(?:stock|balance|qty|quantity|inventory)\b",
+        question.strip(), re.I,
     )
-    if m:
-        item_code = m.group(1).strip()
-    else:
-        # Try "stock of <item>" / "stock for <item>" patterns
+    if m0 and _looks_like_item_code(m0.group(1)):
+        item_code = m0.group(1).strip()
+
+    # Pattern 2: "item code XXXX YYYY" — greedy up to delimiter
+    if not item_code:
+        m = re.search(
+            r"\bitem\s+(?:code\s+)?([A-Z0-9][A-Z0-9 \-\.]+?)(?:\s+in\b|\s+at\b|\s+for\b|\s+warehouse|\s+stock|\?|$)",
+            question, re.I,
+        )
+        if m and _looks_like_item_code(m.group(1)):
+            item_code = m.group(1).strip()
+
+    # Pattern 3: "stock of <item>" / "stock for <item>"
+    if not item_code:
         m2 = re.search(
             r"\b(?:stock|balance|qty|quantity)\s+(?:of|for)\s+([A-Z0-9][A-Z0-9 \-\.]+?)(?:\s+in\b|\s+at\b|\?|$)",
             question, re.I,
         )
-        if m2:
+        if m2 and _looks_like_item_code(m2.group(1)):
             item_code = m2.group(1).strip()
-        else:
-            # Try uppercase-only token (classic Frappe codes like SLR-100W — no spaces)
-            item_match = re.search(r"\b([A-Z][A-Z0-9\-\.]{2,})\b", question)
-            if not item_match and history:
-                item_match = re.search(r"\b([A-Z][A-Z0-9\-\.]{2,})\b", history)
-            item_code = item_match.group(1) if item_match else None
+
+    # Pattern 4: uppercase-only token (classic Frappe codes like SLR-100W — no spaces).
+    # Only fall back to history when the user is referring back ("its qty", "that
+    # item"), otherwise we'd hijack vague queries with leftover codes from earlier
+    # turns — e.g. "what is total stock count?" picking up "SSE" or "BOM" from a
+    # prior answer.
+    if not item_code:
+        item_match = re.search(r"\b([A-Z][A-Z0-9\-\.]{2,})\b", question)
+        if not item_match and history and _REFERS_BACK_RE.search(question):
+            item_match = re.search(r"\b([A-Z][A-Z0-9\-\.]{2,})\b", history)
+        item_code = item_match.group(1) if item_match else None
 
     # If we have a code, look it up directly
     if item_code:

@@ -251,6 +251,9 @@ def execute_safe_select(sql: str, limit: int = 100) -> list[dict]:
         return cur.fetchall()
 
 
+_VALID_LOG_STATUS = {"Success", "Error", "Timeout", "Permission Denied"}
+
+
 def log_chat(
     user: str,
     question: str,
@@ -259,20 +262,28 @@ def log_chat(
     sources: list[str] | None = None,
     current_doctype: str = "",
     current_doc: str = "",
-    used_db: bool = False,
+    route: str = "",
+    status: str = "Success",
+    execution_ms: int = 0,
 ) -> str | None:
     """
     Write a chat interaction directly to `tabAI Chat Log` in Frappe MariaDB.
     Returns the generated document name on success, None on failure.
 
     Frappe naming series: AICL-YYYY-MM-DD-NNNNN (generated locally — no Frappe runtime needed).
-    All fields mirror the tabAI Chat Log doctype columns observed via DESCRIBE.
+
+    `_route`, `status`, `execution_ms` are stored as flat columns (added by the
+    Frappe-side ai_chat_log.json patch), so logs.py --stats can GROUP BY directly.
     """
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
     date_part = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     suffix = uuid.uuid4().hex[:5].upper()
     name = f"AICL-{date_part}-{suffix}"
     sources_str = "\n".join(sources) if sources else ""
+
+    if status not in _VALID_LOG_STATUS:
+        status = "Success"
+    execution_ms = max(0, int(execution_ms or 0))
 
     try:
         with db_cursor() as cur:
@@ -281,16 +292,19 @@ def log_chat(
                 INSERT INTO `tabAI Chat Log`
                     (name, creation, modified, modified_by, owner, docstatus,
                      user, question, answer, sources, session_id,
-                     current_doctype, current_doc, timestamp)
+                     current_doctype, current_doc, timestamp,
+                     `_route`, status, execution_ms)
                 VALUES
                     (%s, %s, %s, %s, %s, 0,
                      %s, %s, %s, %s, %s,
+                     %s, %s, %s,
                      %s, %s, %s)
                 """,
                 (
                     name, now, now, user, user,
                     user, question, answer, sources_str, session_id or "",
                     current_doctype or "", current_doc or "", now,
+                    route or "", status, execution_ms,
                 ),
             )
         return name
@@ -430,6 +444,210 @@ def search_items_by_name(term: str, limit: int = 5) -> list[dict]:
             (like, like, limit),
         )
         return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Workflow queries
+# ---------------------------------------------------------------------------
+
+def get_active_workflow_for_doctype(doctype: str) -> dict | None:
+    """
+    Return the active workflow definition for a given DocType, or None.
+    Picks the first active row — Frappe normally enforces one active workflow per doctype.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT name, document_type, workflow_state_field, send_email_alert "
+            "FROM `tabWorkflow` WHERE document_type = %s AND is_active = 1 LIMIT 1",
+            (doctype,),
+        )
+        return cur.fetchone()
+
+
+def get_workflow_states(workflow_name: str) -> list[dict]:
+    """States for a workflow: state, doc_status, allow_edit (role), update_field/value."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT state, doc_status, allow_edit, update_field, update_value, idx "
+            "FROM `tabWorkflow Document State` WHERE parent = %s ORDER BY idx",
+            (workflow_name,),
+        )
+        return cur.fetchall()
+
+
+def get_workflow_transitions(workflow_name: str) -> list[dict]:
+    """Transitions: state, action, next_state, allowed (role), `condition` (Python expr)."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT state, action, next_state, allowed, `condition`, idx "
+            "FROM `tabWorkflow Transition` WHERE parent = %s ORDER BY idx",
+            (workflow_name,),
+        )
+        return cur.fetchall()
+
+
+def list_active_workflows() -> list[dict]:
+    """All active workflows with their target doctype."""
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT name, document_type FROM `tabWorkflow` "
+            "WHERE is_active = 1 ORDER BY document_type"
+        )
+        return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Hand-written list queries (used by NL guardrail to avoid LLM-generated SQL)
+# ---------------------------------------------------------------------------
+
+def list_users(enabled_only: bool = True, limit: int = 100) -> list[dict]:
+    extra = "AND enabled = 1 " if enabled_only else ""
+    sql = (
+        "SELECT name, full_name, enabled FROM `tabUser` "
+        f"WHERE name NOT IN ('Administrator', 'Guest') {extra}"
+        "ORDER BY full_name LIMIT %s"
+    )
+    with db_cursor() as cur:
+        cur.execute(sql, (limit,))
+        return cur.fetchall()
+
+
+def list_warehouses(limit: int = 200) -> list[dict]:
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT name, warehouse_type, company, disabled FROM `tabWarehouse` "
+            "WHERE disabled = 0 ORDER BY name LIMIT %s",
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+def list_roles(limit: int = 200) -> list[dict]:
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT name, disabled FROM `tabRole` "
+            "WHERE disabled = 0 AND name NOT IN ('All', 'Guest', 'Administrator') "
+            "ORDER BY name LIMIT %s",
+            (limit,),
+        )
+        return cur.fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Athena Skill — admin-curated workflow content (replaces RAG for known topics)
+# ---------------------------------------------------------------------------
+
+def find_athena_skill_match(question: str) -> dict | None:
+    """
+    Sweep Published Workflow skills, return the first whose intent_pattern matches.
+    Side effect: increments use_count + last_used on hit. Best-effort — silently
+    returns None if the doctype doesn't exist yet (Frappe-side rollout pending).
+    """
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "SELECT name, skill_id, title, intent_pattern, content_md "
+                "FROM `tabAthena Skill` "
+                "WHERE status = 'Published' AND skill_type = 'Workflow' "
+                "AND intent_pattern IS NOT NULL AND intent_pattern != '' "
+                "ORDER BY modified DESC"
+            )
+            skills = cur.fetchall()
+    except Exception:
+        return None
+
+    for sk in skills:
+        try:
+            if re.search(sk["intent_pattern"], question, re.I):
+                _increment_skill_usage(sk["name"])
+                return sk
+        except re.error:
+            continue
+    return None
+
+
+def _increment_skill_usage(skill_name: str) -> None:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    try:
+        with db_cursor() as cur:
+            cur.execute(
+                "UPDATE `tabAthena Skill` "
+                "SET use_count = COALESCE(use_count, 0) + 1, last_used = %s, modified = %s "
+                "WHERE name = %s",
+                (now, now, skill_name),
+            )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Saved Reports (read-only) — list + execute Query Reports
+# ---------------------------------------------------------------------------
+
+def list_saved_reports(
+    filter_doctype: str | None = None,
+    report_type: str | None = "Query Report",
+    limit: int = 50,
+) -> list[dict]:
+    """
+    List enabled `tabReport` rows. Defaults to Query Reports only — they're the
+    only kind Athena can actually execute. Pass `report_type=None` to list all.
+    """
+    sql = (
+        "SELECT name, ref_doctype, report_type FROM `tabReport` "
+        "WHERE disabled = 0"
+    )
+    params: list[Any] = []
+    if report_type:
+        sql += " AND report_type = %s"
+        params.append(report_type)
+    if filter_doctype:
+        sql += " AND ref_doctype = %s"
+        params.append(filter_doctype)
+    sql += " ORDER BY name LIMIT %s"
+    params.append(limit)
+    with db_cursor() as cur:
+        cur.execute(sql, params)
+        return cur.fetchall()
+
+
+def get_query_report(report_name: str) -> dict | None:
+    """
+    Fetch a Query Report by name (only Query Reports carry runnable SQL).
+    Returns None if not found, disabled, or not a Query Report.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT name, ref_doctype, report_type, query "
+            "FROM `tabReport` WHERE name = %s AND disabled = 0",
+            (report_name,),
+        )
+        row = cur.fetchone()
+    if not row or row.get("report_type") != "Query Report" or not row.get("query"):
+        return row
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Doctype info (schema reflection for a single doctype)
+# ---------------------------------------------------------------------------
+
+def get_doctype_info(doctype: str) -> dict | None:
+    """
+    Return basic metadata for a doctype: module, autoname, naming_rule, custom?,
+    plus column list. Returns None if the doctype isn't registered.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            "SELECT name, module, autoname, naming_rule, custom, istable, issingle "
+            "FROM `tabDocType` WHERE name = %s",
+            (doctype,),
+        )
+        meta = cur.fetchone()
+    if not meta:
+        return None
+    meta["columns"] = get_table_columns(f"tab{doctype}")
+    return meta
 
 
 def search_doctype(doctype: str, filters: dict[str, Any], fields: list[str] | None = None, limit: int = 20) -> list[dict]:

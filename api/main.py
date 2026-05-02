@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 import logging
 import sqlite3
 import os
+import time
 
 from rag import RAGPipeline
 from tools import route_query, wants_sources
@@ -86,6 +87,9 @@ def _log_chat(
     sources: list[str],
     current_doctype: str,
     current_doc: str,
+    route: str,
+    status: str,
+    execution_ms: int,
 ):
     """Write to tabAI Chat Log in MariaDB. Falls back to SQLite on failure."""
     try:
@@ -98,7 +102,9 @@ def _log_chat(
             sources=sources,
             current_doctype=current_doctype or "",
             current_doc=current_doc or "",
-            used_db=used_db,
+            route=route,
+            status=status,
+            execution_ms=execution_ms,
         )
     except Exception as e:
         logger.warning(f"MariaDB log failed, writing to SQLite fallback: {e}")
@@ -236,15 +242,48 @@ def chat(req: ChatRequest):
     if req.current_doc:
         user_context += f"\nCurrently open document: {req.current_doc}"
 
-    result = route_query(req.message, req.username, history=history, schema_retriever=schema_retriever)
-    used_db = result is not None
+    started = time.perf_counter()
+    status = "Success"
+    answer = ""
+    sources: list[str] = []
+    route = ""
+    used_db = False
 
-    if result is None:
-        result = rag.query(req.message, history=history, user_context=user_context)
+    try:
+        result = route_query(
+            req.message, req.username,
+            history=history, schema_retriever=schema_retriever,
+            user_roles=req.user_roles,
+        )
+        used_db = result is not None
+        route = result.get("_route", "") if result else ""
 
-    answer = result["answer"]
-    sources = result.get("sources", [])
+        if result is None:
+            result = rag.query(req.message, history=history, user_context=user_context)
+            route = result.get("_route", "rag")
+
+        answer = result["answer"]
+        sources = result.get("sources", [])
+
+        # Lightweight status inference from the answer text. Hard exceptions are
+        # caught below; this catches handler-reported soft failures (timeouts,
+        # permission gating on NL→SQL).
+        a_lower = answer.lower()
+        if "temporarily unavailable" in a_lower or "not responding" in a_lower:
+            status = "Timeout"
+        elif "do not have permission" in a_lower or "you don't have permission" in a_lower \
+                or "not authorized" in a_lower:
+            status = "Permission Denied"
+        elif "query failed" in a_lower or "query rejected" in a_lower or "unknown column" in a_lower:
+            status = "Error"
+    except Exception as e:
+        logger.exception("chat handler crashed")
+        status = "Error"
+        answer = f"Sorry — something went wrong handling that question. ({type(e).__name__})"
+        route = route or "error"
+
     visible_sources = sources if wants_sources(req.message) else []
+    execution_ms = int((time.perf_counter() - started) * 1000)
 
     _log_chat(
         username=req.username,
@@ -255,6 +294,9 @@ def chat(req: ChatRequest):
         sources=sources,
         current_doctype=req.current_doctype or "",
         current_doc=req.current_doc or "",
+        route=route,
+        status=status,
+        execution_ms=execution_ms,
     )
 
     return ChatResponse(answer=answer, sources=visible_sources)

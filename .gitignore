@@ -19,3 +19,6 @@ chroma_data/
 
 # OS
 .DS_Store
+
+# Reference: external repo kept locally for pattern-borrowing only (AGPL-3.0, do not merge)
+FAC/
